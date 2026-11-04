@@ -1,0 +1,89 @@
+/* Workforce — Phase 7 */
+
+.wf-agent {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(var(--border-rgb), 0.16);
+  background: rgba(255, 255, 255, 0.015);
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.wf-agent:hover,
+.wf-agent.active {
+  border-color: rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.05);
+}
+
+.wf-agent-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.wf-agent-head b {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wf-agent-head .adv-actions {
+  gap: 4px;
+}
+
+.wf-mission {
+  margin: 6px 0 8px;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wf-agent .training-bar {
+  margin-top: 8px;
+}
+
+.wf-shifts .adv-tr {
+  grid-template-columns: 108px 96px 96px minmax(120px, 1.4fr) minmax(140px, 1.6fr) 112px;
+}
+
+.wf-note {
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(var(--border-rgb), 0.14);
+  background: rgba(255, 255, 255, 0.015);
+  margin-bottom: 8px;
+}
+
+.wf-note.unread {
+  border-color: rgba(var(--accent-rgb), 0.35);
+  background: rgba(var(--accent-rgb), 0.05);
+}
+
+.wf-note-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.wf-note-head b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.wf-note-body {
+  margin: 6px 0;
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

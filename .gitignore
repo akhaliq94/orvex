@@ -1,0 +1,20 @@
+node_modules/
+dist/
+release/
+build/
+.smoke/
+reports/
+shots/
+tsconfig.tsbuildinfo
+
+*.log
+.env
+.env.*
+!.env.example
+
+# never commit local secrets or signing keys
+secrets.json
+data/
+keys/
+*.pem
+*.key

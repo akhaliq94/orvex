@@ -1,0 +1,265 @@
+/* ── Integrations page ─────────────────────────────────────────────────── */
+.ig-page {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  height: 100%;
+  min-height: 0;
+}
+
+.ig-tabs { flex: none; }
+.ig-head-btn { height: 28px; font-size: 10.5px; }
+.ig-spin { animation: ig-spin 0.9s linear infinite; }
+@keyframes ig-spin { to { transform: rotate(360deg); } }
+
+.ig-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 13px;
+  border-radius: 12px;
+  border: 1px solid rgba(var(--border-rgb), 0.22);
+  background: rgba(255, 255, 255, 0.03);
+}
+.ig-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ig-editor-head strong { font-size: 11.5px; font-family: Sora, sans-serif; color: var(--text); }
+.ig-editor-head .dc-muted { margin-left: auto; }
+
+.ig-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1px solid rgba(var(--border-rgb), 0.25);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+}
+.ig-icon-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+.ig-editor-head .ig-icon-btn { margin-left: auto; }
+
+.ig-kind-row, .ig-action-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ig-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(var(--border-rgb), 0.25);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ig-kind:hover { color: var(--text); border-color: rgba(var(--accent-rgb), 0.4); }
+.ig-kind.on {
+  color: var(--text);
+  border-color: rgba(var(--accent-rgb), 0.55);
+  background: rgba(var(--accent-rgb), 0.14);
+}
+
+.ig-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.ig-field > span { font-size: 10px; color: var(--muted); }
+.ig-field input, .ig-field textarea, .ig-field select,
+.ig-rest-line input, .ig-rest-line select,
+.ig-filter-row select,
+.ig-policy {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(var(--border-rgb), 0.26);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text);
+  font-size: 11.5px;
+  outline: none;
+  font-family: inherit;
+}
+.ig-field textarea { resize: vertical; min-height: 62px; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 11px; }
+.ig-field input:focus, .ig-field textarea:focus, .ig-field select:focus,
+.ig-rest-line input:focus, .ig-rest-line select:focus { border-color: rgba(var(--accent-rgb), 0.5); }
+.ig-field input:disabled, .ig-field textarea:disabled { opacity: 0.45; }
+
+.ig-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
+.ig-span-2 { grid-column: 1 / -1; }
+
+.ig-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 26px 16px;
+  text-align: center;
+  color: var(--muted);
+  border-radius: 12px;
+  border: 1px dashed rgba(var(--border-rgb), 0.26);
+  background: rgba(255, 255, 255, 0.015);
+}
+.ig-empty strong { font-size: 12px; color: var(--text); }
+.ig-empty p { margin: 0; font-size: 10.5px; max-width: 460px; line-height: 1.55; }
+
+.ig-conn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
+.ig-conn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 12px;
+  border-radius: 11px;
+  border: 1px solid rgba(var(--border-rgb), 0.2);
+  background: rgba(255, 255, 255, 0.025);
+}
+.ig-conn.on { border-color: rgba(var(--accent-rgb), 0.5); background: rgba(var(--accent-rgb), 0.06); }
+.ig-conn-head { display: flex; align-items: center; gap: 8px; }
+.ig-conn-head strong { font-size: 12px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-conn-head .dc-chip { margin-left: auto; flex: none; }
+.ig-conn-meta { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--faint); }
+.ig-conn-id { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-conn-test { margin: 0; font-size: 10px; color: var(--muted); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.dc-chip.bad { color: #ff9daf; background: rgba(255, 90, 110, 0.12); border-color: rgba(255, 90, 110, 0.4); }
+.ig-danger { color: #ff9daf; }
+.ig-danger:hover { border-color: rgba(255, 90, 110, 0.5); color: #ffc2cb; }
+
+.ig-action-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 13px;
+  border-radius: 12px;
+  border: 1px solid rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--accent-rgb), 0.04);
+}
+
+.ig-output {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid rgba(var(--border-rgb), 0.24);
+  background: rgba(0, 0, 0, 0.22);
+  font-size: 11px;
+  color: var(--text);
+  word-break: break-word;
+}
+.ig-output.bad { border-color: rgba(255, 90, 110, 0.35); color: #ffb8c4; font-size: 11px; }
+.ig-output-head { display: flex; align-items: center; gap: 8px; }
+.ig-output-head span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-output pre, .ig-pre {
+  margin: 0;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+}
+.bad-text { color: #ffb8c4 !important; }
+
+.ig-rest-line { display: flex; gap: 6px; align-items: center; }
+.ig-rest-line select { width: 96px; flex: none; }
+.ig-rest-line input { flex: 1; }
+.ig-rest-line .dc-btn { flex: none; }
+
+.ig-status {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.ig-status.ok { color: #7fe0a8; background: rgba(80, 220, 140, 0.12); }
+.ig-status.bad { color: #ff9daf; background: rgba(255, 90, 110, 0.14); }
+
+.ig-kv-table { display: flex; flex-direction: column; gap: 2px; max-height: 150px; overflow: auto; }
+.ig-kv-table > div { display: grid; grid-template-columns: 170px 1fr; gap: 8px; font-size: 10px; }
+.ig-kv-table b { color: var(--faint); font-weight: 600; }
+.ig-kv-table span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.ig-copy-row { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 8px; border: 1px solid rgba(var(--border-rgb), 0.22); background: rgba(0, 0, 0, 0.2); }
+.ig-copy-row code { flex: 1; min-width: 0; font-size: 10.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-copy-row .dc-btn { flex: none; }
+.ig-copy-label { font-size: 9.5px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.06em; flex: none; }
+.ig-token { color: var(--accent) !important; user-select: all; }
+
+.ig-method { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 5px; background: rgba(255, 255, 255, 0.08); color: var(--text); }
+.ig-method.GET { color: #7fc7ff; }
+.ig-method.POST { color: #7fe0a8; }
+.ig-method.PUT, .ig-method.PATCH { color: #ffd479; }
+.ig-method.DELETE { color: #ff9daf; }
+
+.ig-conn-list { display: flex; flex-direction: column; gap: 8px; }
+.ig-conn-ops { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow: auto; padding: 4px 0; }
+.ig-conn-op { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 7px; border-bottom: 1px solid rgba(var(--border-rgb), 0.12); font-size: 10.5px; text-align: left; }
+.ig-conn-op code { flex: none; font-size: 10px; color: var(--text); }
+.ig-conn-op .dc-muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-conn-op-btn { width: 100%; background: transparent; border: none; border-bottom: 1px solid rgba(var(--border-rgb), 0.12); color: inherit; font-family: inherit; cursor: pointer; }
+.ig-conn-op-btn:hover { background: rgba(255, 255, 255, 0.04); }
+
+.ig-event { border-bottom: 1px solid rgba(var(--border-rgb), 0.14); padding: 5px 0; }
+.ig-event summary { display: flex; align-items: center; gap: 8px; cursor: pointer; list-style: none; }
+.ig-event summary::-webkit-details-marker { display: none; }
+.ig-event-path { flex: 1; min-width: 0; font-size: 10.5px; color: var(--text); font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-event-body { padding: 6px 0 2px 4px; display: flex; flex-direction: column; gap: 4px; }
+
+.ig-flow { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(var(--border-rgb), 0.24); background: rgba(255, 255, 255, 0.03); }
+.ig-flow.pending { border-color: rgba(255, 212, 121, 0.4); }
+.ig-flow.done { border-color: rgba(80, 220, 140, 0.4); }
+.ig-flow.error, .ig-flow.denied, .ig-flow.expired { border-color: rgba(255, 90, 110, 0.4); }
+.ig-flow-head { display: flex; align-items: center; gap: 8px; }
+.ig-flow-head strong { font-size: 11.5px; color: var(--text); text-transform: capitalize; }
+.ig-flow-head .dc-muted { margin-left: auto; }
+.ig-user-code { display: flex; align-items: center; gap: 8px; }
+.ig-user-code code { font-size: 20px; letter-spacing: 0.18em; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; color: var(--accent); user-select: all; }
+
+.ig-account { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid rgba(var(--border-rgb), 0.14); }
+.ig-account > div { flex: 1; min-width: 0; }
+.ig-account strong { font-size: 11.5px; color: var(--text); }
+.ig-account-id { font-size: 10px; color: var(--faint); user-select: all; }
+
+.ig-check { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted); cursor: pointer; }
+.ig-check input { accent-color: var(--accent); }
+
+.ig-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.ig-stat-grid > div { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 9px; border: 1px solid rgba(var(--border-rgb), 0.18); background: rgba(255, 255, 255, 0.025); }
+.ig-stat-grid b { font-size: 15px; color: var(--text); font-family: Sora, sans-serif; }
+.ig-stat-grid span { font-size: 9.5px; color: var(--faint); }
+
+.ig-filter-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ig-search { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 180px; padding: 6px 9px; border-radius: 8px; border: 1px solid rgba(var(--border-rgb), 0.26); background: rgba(0, 0, 0, 0.18); color: var(--faint); }
+.ig-search input { flex: 1; background: transparent; border: none; outline: none; color: var(--text); font-size: 11.5px; font-family: inherit; }
+.ig-filter-row select { width: 120px; padding: 6px 8px; border-radius: 8px; }
+
+.ig-perm-list { display: flex; flex-direction: column; gap: 2px; }
+.ig-perm { display: grid; grid-template-columns: 240px 1fr 96px; gap: 10px; align-items: center; padding: 7px 8px; border-radius: 8px; border-bottom: 1px solid rgba(var(--border-rgb), 0.12); }
+.ig-perm:hover { background: rgba(255, 255, 255, 0.025); }
+.ig-perm-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ig-perm-name code { font-size: 10.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ig-perm-name span { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
+.ig-perm-desc { margin: 0; font-size: 10px; color: var(--muted); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ig-policy { padding: 5px 7px; font-size: 10.5px; }
+.ig-policy.allow { border-color: rgba(80, 220, 140, 0.45); color: #7fe0a8; }
+.ig-policy.ask { border-color: rgba(255, 212, 121, 0.45); color: #ffd479; }
+.ig-policy.deny { border-color: rgba(255, 90, 110, 0.45); color: #ff9daf; }
+
+@media (max-width: 1100px) {
+  .ig-perm { grid-template-columns: 170px 1fr 90px; }
+}
