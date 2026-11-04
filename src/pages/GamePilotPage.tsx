@@ -38,6 +38,8 @@ type Draft = {
   scoreRegex: string
   targetScore: string
   intervalMs: string
+  actMs: string
+  reuseOnIdle: boolean
   maxMinutes: string
   autoFocus: boolean
 }
@@ -54,7 +56,9 @@ const EMPTY: Draft = {
   scoreRegion: '',
   scoreRegex: '',
   targetScore: '',
-  intervalMs: '1500',
+  intervalMs: '750',
+  actMs: '120',
+  reuseOnIdle: true,
   maxMinutes: '30',
   autoFocus: true,
 }
@@ -121,6 +125,8 @@ function toDraft(profile: OrvexGameProfile): Draft {
     scoreRegex: profile.scoreRegex,
     targetScore: profile.targetScore === null ? '' : String(profile.targetScore),
     intervalMs: String(profile.intervalMs),
+    actMs: String(profile.actMs),
+    reuseOnIdle: profile.reuseOnIdle !== false,
     maxMinutes: String(profile.maxMinutes),
     autoFocus: profile.autoFocus,
   }
@@ -212,7 +218,9 @@ export default function GamePilotPage({ onBack, notify }: Props) {
           scoreRegion: parseRegion(draft.scoreRegion, 'Score region'),
           scoreRegex: draft.scoreRegex.trim(),
           targetScore: draft.targetScore.trim() === '' ? null : Number(draft.targetScore),
-          intervalMs: Number(draft.intervalMs) || 1500,
+          intervalMs: Number(draft.intervalMs) || 750,
+          actMs: Number(draft.actMs) || 120,
+          reuseOnIdle: draft.reuseOnIdle,
           maxMinutes: Number(draft.maxMinutes) || 30,
           autoFocus: draft.autoFocus,
         }),
@@ -472,9 +480,27 @@ export default function GamePilotPage({ onBack, notify }: Props) {
                   </select>
                 </label>
                 <label className="adv-field">
-                  <span>Interval between actions (ms)</span>
-                  <input className="adv-input" type="number" min={500} max={15000} step={100} value={draft.intervalMs} onChange={(e) => set('intervalMs', e.target.value)} />
+                  <span>Interval between batches (ms)</span>
+                  <input
+                    className="adv-input"
+                    type="number"
+                    min={draft.policy === 'vision' ? 250 : 100}
+                    max={15000}
+                    step={50}
+                    value={draft.intervalMs}
+                    onChange={(e) => set('intervalMs', e.target.value)}
+                  />
                 </label>
+                <label className="adv-field">
+                  <span>Gap between keys inside a batch (ms)</span>
+                  <input className="adv-input" type="number" min={40} max={2000} step={20} value={draft.actMs} onChange={(e) => set('actMs', e.target.value)} />
+                </label>
+                {draft.policy === 'vision' && (
+                  <label className="adv-field game-check">
+                    <span>Fast reuse: when the screen has not changed, replay the last keys without a model call</span>
+                    <input type="checkbox" checked={draft.reuseOnIdle} onChange={(e) => set('reuseOnIdle', e.target.checked)} />
+                  </label>
+                )}
 
                 {draft.policy === 'vision' ? (
                   <label className="adv-field">

@@ -229,7 +229,8 @@ const PNG_1X1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
         windowAction: async () => ({ ok: true }),
       },
       ocr: async () => ({ ok: true, text: '' }),
-      ask: async () => '{"action":"key","key":"SPACE"}',
+      ask: async ({ profile }) =>
+        profile.policy === 'vision' ? '{"actions":[{"key":"W"},{"key":"SPACE"}]}' : '{"action":"key","key":"SPACE"}',
       record: async (payload) => {
         recordedRuns.push(payload);
         return payload;
@@ -278,6 +279,37 @@ const PNG_1X1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
       finishedEvent && /stopped by the user/i.test(finishedEvent.stopReasonLabel || ''),
       finishedEvent ? finishedEvent.stopReasonLabel : 'no event',
     );
+    const visionProfile = gamePilot.saveProfile({
+      name: 'Smoke fast vision',
+      windowTitle: 'Smoke Game',
+      policy: 'vision',
+      actions: [{ key: 'W' }, { key: 'SPACE' }],
+      intervalMs: 250,
+      actMs: 40,
+      maxMinutes: 1,
+    });
+    const fastStart = keysPressed.length;
+    gamePilot.start(visionProfile.id);
+    await sleep(700);
+    gamePilot.stop();
+    await Promise.race([
+      new Promise((resolve) => {
+        const timer = setInterval(() => {
+          if (!gamePilot.status().running) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 50);
+      }),
+      sleep(4000),
+    ]);
+    const fastKeys = keysPressed.slice(fastStart);
+    check(
+      'a vision batch presses every key from one model reply',
+      fastKeys.includes('W') && fastKeys.includes('SPACE'),
+      fastKeys.join(', ') || 'nothing pressed',
+    );
+    gamePilot.deleteProfile(visionProfile.id);
     gamePilot.deleteProfile(pilotProfile.id);
     check('the pilot profile is deletable after the run', !gamePilot.listProfiles().some((p) => p.id === pilotProfile.id));
 

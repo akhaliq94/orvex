@@ -14,6 +14,8 @@
  * grinding loops — not twitch shooters.
  */
 
+const crypto = require('node:crypto');
+const fs = require('node:fs');
 const db = require('./db.cjs');
 const core = require('./game-core.cjs');
 
@@ -22,6 +24,7 @@ const STOP_ACCEL = 'CommandOrControl+Alt+Shift+G';
 const HISTORY_LIMIT = 20;
 const MAX_WINDOW_MISSES = 10;
 const MAX_FAILURES = 3;
+const MAX_IDLE_REPEATS = 1200;
 
 let ctx = {
   now: () => Date.now(),
@@ -120,6 +123,7 @@ function snapshot(run) {
     startedAt: run.startedAt,
     endsAt: run.deadline,
     ticks: run.ticks,
+    reused: run.reused,
     bestScore: run.bestScore,
     lastScore: run.lastScore,
     targetScore: profile.targetScore,
@@ -211,6 +215,16 @@ async function findGameWindow(run) {
   return hit || null;
 }
 
+function frameSignature(shot) {
+  try {
+    const file = shot && (shot.file || shot.image);
+    if (!file || typeof file !== 'string' || file.startsWith('data:')) return '';
+    return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex');
+  } catch {
+    return '';
+  }
+}
+
 async function readScore(run, shot) {
   const profile = run.profile;
   if (!profile.scoreRegex && !profile.scoreRegion) return null;
@@ -243,7 +257,7 @@ async function decide(run, shot) {
     history: run.history.slice(-8),
     tick: run.ticks + 1,
   });
-  return core.parseDecision(reply, profile.actions.map((a) => a.key));
+  return core.parseBatch(reply, profile.actions.map((a) => a.key), { actMs: profile.actMs });
 }
 
 async function stillForeground(run) {
@@ -320,17 +334,37 @@ async function loop(run) {
         }
       }
 
-      let action = null;
-      try {
-        action = await decide(run, shot);
-      } catch (err) {
-        run.error = msg(err);
-        run.stopReason = 'error';
-        run.lastNote = `Decision failed: ${run.error}`;
-        pushHistory(run, '', run.lastNote, score);
-        break;
+      const signature = frameSignature(shot);
+      const replay =
+        profile.policy === 'vision' &&
+        profile.reuseOnIdle &&
+        signature &&
+        run.lastBatch &&
+        signature === run.lastSig &&
+        run.idleRepeats < MAX_IDLE_REPEATS;
+
+      let decision = null;
+      if (replay) {
+        decision = { type: 'batch', actions: run.lastBatch, reused: true };
+        run.idleRepeats += 1;
+        run.reused += 1;
+        run.lastNote = 'Screen unchanged — reusing the last actions without a model call.';
+      } else {
+        try {
+          decision = await decide(run, shot);
+        } catch (err) {
+          run.error = msg(err);
+          run.stopReason = 'error';
+          run.lastNote = `Decision failed: ${run.error}`;
+          pushHistory(run, '', run.lastNote, score);
+          break;
+        }
+        run.lastSig = signature;
+        run.idleRepeats = 0;
+        if (decision && decision.type === 'batch' && profile.policy === 'vision') run.lastBatch = decision.actions;
       }
-      if (!action) {
+
+      if (!decision) {
         run.ticks += 1;
         run.lastNote = profile.policy === 'vision'
           ? 'The model did not return an allowed key — no key was pressed.'
@@ -340,51 +374,80 @@ async function loop(run) {
         await pause(run, profile.intervalMs);
         continue;
       }
-      if (action.type === 'stop') {
+      if (decision.type === 'stop') {
         run.stopReason = 'model';
-        run.lastNote = action.reason || 'The model stopped the run.';
+        run.lastNote = decision.reason || 'The model stopped the run.';
         pushHistory(run, 'stop', run.lastNote, score);
         break;
       }
 
-      run.ticks += 1;
-      if (action.type === 'key') {
-        if (!(await stillForeground(run))) {
-          run.lastNote = 'The game window is no longer in front — no key was pressed.';
-          pushHistory(run, '', run.lastNote, score);
-          emitTick(run);
-          await pause(run, Math.max(600, profile.intervalMs));
-          continue;
+      const batch = decision.type === 'batch' ? decision.actions : [decision];
+      let stopNow = false;
+      for (const action of batch) {
+        if (run.stopRequested) break;
+        if (now() >= run.deadline) {
+          run.stopReason = 'time';
+          stopNow = true;
+          break;
         }
-        let result;
-        try {
-          result = await ctx.desktop.keyPress({ keys: action.key });
-        } catch (err) {
-          result = { ok: false, error: msg(err) };
+        if (typeof ctx.isStopped === 'function' && ctx.isStopped()) {
+          run.stopReason = 'security';
+          stopNow = true;
+          break;
         }
-        if (!result || result.ok === false) {
-          run.inputErrors += 1;
-          run.lastNote = `${action.key} failed: ${(result && result.error) || 'unknown error'}`;
-          if (run.inputErrors >= MAX_FAILURES) {
-            run.stopReason = 'input';
-            run.error = run.lastNote;
-            pushHistory(run, action.key, run.lastNote, score);
+        if (action.type === 'stop') {
+          run.stopReason = 'model';
+          run.lastNote = action.reason || 'The model stopped the run.';
+          pushHistory(run, 'stop', run.lastNote, score);
+          stopNow = true;
+          break;
+        }
+
+        run.ticks += 1;
+        if (action.type === 'key') {
+          if (!(await stillForeground(run))) {
+            run.lastNote = 'The game window is no longer in front — no key was pressed.';
+            pushHistory(run, '', run.lastNote, score);
+            emitTick(run);
             break;
           }
-        } else {
-          run.inputErrors = 0;
-          run.lastAction = action.key;
-          run.lastNote = action.note || `Pressed ${action.key}`;
+          let result;
+          try {
+            result = await ctx.desktop.keyPress({ keys: action.key });
+          } catch (err) {
+            result = { ok: false, error: msg(err) };
+          }
+          if (!result || result.ok === false) {
+            run.inputErrors += 1;
+            run.lastNote = `${action.key} failed: ${(result && result.error) || 'unknown error'}`;
+            pushHistory(run, action.key, run.lastNote, score);
+            if (run.inputErrors >= MAX_FAILURES) {
+              run.stopReason = 'input';
+              run.error = run.lastNote;
+              stopNow = true;
+              break;
+            }
+          } else {
+            run.inputErrors = 0;
+            run.lastAction = action.key;
+            run.lastNote = action.note || `Pressed ${action.key}`;
+            pushHistory(run, action.key, run.lastNote, score);
+            await pause(run, action.waitMs === undefined ? profile.actMs : action.waitMs);
+          }
+        } else if (action.type === 'wait') {
+          run.lastAction = `wait ${action.ms} ms`;
+          run.lastNote = action.note || `Waiting ${action.ms} ms`;
+          pushHistory(run, 'wait', run.lastNote, score);
+          await pause(run, action.ms);
         }
-        pushHistory(run, action.key, run.lastNote, score);
-        if (action.waitMs) await pause(run, action.waitMs);
-      } else if (action.type === 'wait') {
-        run.lastAction = `wait ${action.ms} ms`;
-        run.lastNote = action.note || `Waiting ${action.ms} ms`;
-        pushHistory(run, 'wait', run.lastNote, score);
-        await pause(run, action.ms);
+        emitTick(run);
       }
-      emitTick(run);
+      if (stopNow) break;
+      if (decision.stopAfter) {
+        run.stopReason = 'model';
+        run.lastNote = decision.reason || 'The model ended the run.';
+        break;
+      }
       run.nextTickAt = now() + profile.intervalMs;
       await pause(run, profile.intervalMs);
     }
@@ -436,6 +499,9 @@ async function finish(run) {
           profileId: profile.id,
           policy: profile.policy,
           intervalMs: profile.intervalMs,
+          actMs: profile.actMs,
+          reuseOnIdle: profile.reuseOnIdle,
+          reused: run.reused,
           maxMinutes: profile.maxMinutes,
           targetScore: profile.targetScore,
           region: profile.region,
@@ -504,6 +570,10 @@ function start(profileId) {
     error: null,
     window: null,
     history: [],
+    lastSig: '',
+    lastBatch: null,
+    idleRepeats: 0,
+    reused: 0,
     macroIndex: 0,
     misses: 0,
     captureErrors: 0,

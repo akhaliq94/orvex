@@ -1,8 +1,14 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 
 const require = createRequire(import.meta.url)
 const core = require('../../electron/game-core.cjs')
+const gamePilot = require('../../electron/game-pilot.cjs')
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const base = {
   name: 'Farming loop',
@@ -48,12 +54,21 @@ describe('pilot profile validation', () => {
     expect(() => core.normalizeProfile({ name: 'V', windowTitle: 'Game', policy: 'vision', actions: [] })).toThrow(/vision profile/i)
   })
 
-  it('clamps the interval and enforces the slower vision floor', () => {
-    expect(core.normalizeProfile({ ...base, intervalMs: 10 }).intervalMs).toBe(500)
+  it('clamps the interval and enforces the vision floor', () => {
+    expect(core.normalizeProfile({ ...base, intervalMs: 10 }).intervalMs).toBe(100)
     expect(core.normalizeProfile({ ...base, intervalMs: 999999 }).intervalMs).toBe(15000)
     expect(
-      core.normalizeProfile({ name: 'V', windowTitle: 'Game', policy: 'vision', actions: [{ key: 'W' }], intervalMs: 500 }).intervalMs,
-    ).toBe(1000)
+      core.normalizeProfile({ name: 'V', windowTitle: 'Game', policy: 'vision', actions: [{ key: 'W' }], intervalMs: 100 }).intervalMs,
+    ).toBe(250)
+    expect(core.normalizeProfile({ ...base, intervalMs: 250 }).intervalMs).toBe(250)
+  })
+
+  it('defaults the fast-run fields and clamps the gap between keys', () => {
+    const profile = core.normalizeProfile({ ...base, actMs: 9999 })
+    expect(profile.actMs).toBe(2000)
+    expect(profile.reuseOnIdle).toBe(true)
+    expect(core.normalizeProfile({ ...base, actMs: 1 }).actMs).toBe(40)
+    expect(core.normalizeProfile({ ...base, reuseOnIdle: false }).reuseOnIdle).toBe(false)
   })
 
   it('validates regions and score settings', () => {
@@ -126,6 +141,116 @@ describe('decision parsing', () => {
     const action = core.parseDecision('I think {"action":"key","key":"A","reason":"brace { in text"} is best.', allowed)
     expect(action).toMatchObject({ type: 'key', key: 'A' })
     expect(core.extractJson('no object here')).toBeNull()
+  })
+})
+
+describe('fast batches', () => {
+  const allowed = ['W', 'A', 'SPACE']
+
+  it('keeps an ordered batch and drops keys outside the allow-list', () => {
+    const batch = core.parseBatch(
+      '{"actions":[{"key":"space","waitMs":50},{"key":"Q"},{"key":"A","waitMs":9999}]}',
+      allowed,
+      { actMs: 120 },
+    )
+    expect(batch.type).toBe('batch')
+    expect(batch.actions.map((a) => a.key)).toEqual(['SPACE', 'A'])
+    expect(batch.actions[0].waitMs).toBe(50)
+    expect(batch.actions[1].waitMs).toBe(2000)
+    expect(batch.stopAfter).toBe(false)
+  })
+
+  it('stops after the actions that precede a stop entry', () => {
+    const batch = core.parseBatch('{"actions":[{"key":"W"},{"action":"stop","reason":"menu"}]}', allowed)
+    expect(batch.actions.map((a) => a.key)).toEqual(['W'])
+    expect(batch.stopAfter).toBe(true)
+  })
+
+  it('caps the batch size and returns null when nothing usable remains', () => {
+    const many = JSON.stringify({ actions: Array.from({ length: 12 }, () => ({ key: 'W' })) })
+    expect(core.parseBatch(many, allowed).actions).toHaveLength(core.MAX_BATCH)
+    expect(core.parseBatch('{"actions":[{"key":"Q"},{"key":"Z"}]}', allowed)).toBeNull()
+    expect(core.parseBatch('{"actions":[]}', allowed)).toBeNull()
+    expect(core.parseBatch('no json here', allowed)).toBeNull()
+  })
+
+  it('accepts a single action, wait or stop through the same parser', () => {
+    expect(core.parseBatch('{"key":"w"}', allowed)).toMatchObject({ type: 'batch', actions: [{ key: 'W' }] })
+    expect(core.parseBatch('{"action":"wait","ms":10}', allowed)).toMatchObject({ actions: [{ type: 'wait', ms: 250 }] })
+    expect(core.parseBatch('{"action":"stop","reason":"game over"}', allowed)).toMatchObject({ type: 'stop', reason: 'game over' })
+    expect(core.parseBatch('{"key":"Q"}', allowed)).toBeNull()
+  })
+
+  it('runs a whole batch from one model call and reuses it while the frame is unchanged', async () => {
+    const file = path.join(os.tmpdir(), `orvex-frame-${process.pid}-${Date.now()}.png`)
+    fs.writeFileSync(file, 'identical-frame')
+    const pressed = []
+    let asked = 0
+    gamePilot.init({
+      platform: 'win32',
+      desktop: {
+        windowList: async () => ({ ok: true, windows: [{ title: 'Test Game', foreground: true, hwnd: 1, pid: 1 }] }),
+        screenCapture: async () => ({ ok: true, file, width: 800, height: 600 }),
+        keyPress: async ({ keys }) => {
+          pressed.push(keys)
+          return { ok: true }
+        },
+        windowAction: async () => ({ ok: true }),
+      },
+      ocr: async () => ({ ok: false }),
+      ask: async () => {
+        asked += 1
+        return '{"actions":[{"key":"W"},{"key":"A"}]}'
+      },
+      emit: () => {},
+      isStopped: () => false,
+    })
+    const profile = core.normalizeProfile({
+      name: 'Fast vision',
+      windowTitle: 'Test Game',
+      policy: 'vision',
+      actions: [{ key: 'W' }, { key: 'A' }],
+      intervalMs: 250,
+      actMs: 40,
+      maxMinutes: 1,
+    })
+    const startedAt = Date.now()
+    const run = {
+      id: 'run_test',
+      profile,
+      startedAt,
+      deadline: startedAt + 60_000,
+      ticks: 0,
+      bestScore: null,
+      lastScore: null,
+      lastAction: '',
+      lastNote: '',
+      stopReason: null,
+      stopRequested: false,
+      error: null,
+      window: null,
+      history: [],
+      lastSig: '',
+      lastBatch: null,
+      idleRepeats: 0,
+      reused: 0,
+      macroIndex: 0,
+      misses: 0,
+      captureErrors: 0,
+      inputErrors: 0,
+      nextTickAt: startedAt,
+      hotkeyRegistered: false,
+      finished: false,
+    }
+    const running = gamePilot._internals.loop(run)
+    await sleep(1000)
+    run.stopRequested = true
+    await Promise.race([running, sleep(4000)])
+    fs.rmSync(file, { force: true })
+    expect(asked).toBeLessThanOrEqual(3)
+    expect(pressed.length).toBeGreaterThanOrEqual(4)
+    expect(pressed.every((key) => key === 'W' || key === 'A')).toBe(true)
+    expect(run.reused).toBeGreaterThan(0)
   })
 })
 

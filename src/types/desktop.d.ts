@@ -914,6 +914,8 @@ export type OrvexGameProfile = {
   scoreRegex: string
   targetScore: number | null
   intervalMs: number
+  actMs: number
+  reuseOnIdle: boolean
   maxMinutes: number
   autoFocus: boolean
   display: string
@@ -934,6 +936,7 @@ export type OrvexGameStatus = {
   endsAt?: number
   endedAt?: number
   ticks?: number
+  reused?: number
   bestScore?: number | null
   lastScore?: number | null
   targetScore?: number | null

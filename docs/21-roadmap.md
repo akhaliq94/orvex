@@ -281,7 +281,7 @@ Status as of 2026-11-03: all five original phases are implemented in the v1.0.0 
 
 | Step | What it does | Where | Proof |
 | --- | --- | --- | --- |
-| 20.1 (done) | A named game window can be played with keyboard input under a bounded contract: input is sent only while the configured window is the foreground window (with an optional focus step), only keys listed in the profile are ever pressed, every tick is paced by a 0.5–15 s interval, and a run stops on a hard minute limit, a target score, a global `Ctrl+Alt+Shift+G` shortcut, the emergency stop, ten lost-window checks or three capture/keyboard failures. Vision profiles ask a multimodal model for one JSON action per screenshot and reject anything outside the key allow-list; macro profiles replay a fixed `KEY@waitMs` sequence without a model. The score is read from a cropped score region through Windows OCR, never invented. Each finished run is stored as a training episode with its stop reason, best score and action log | `electron/game-core.cjs`, `electron/game-pilot.cjs`, `electron/main.cjs`, `electron/preload.cjs`, `src/pages/GamePilotPage.tsx`, `src/data/nav.ts` | `tests/unit/game-pilot.test.mjs`, `smoke:advanced` (real loop with fake desktop + recorded episode), e2e bridge check |
+| 20.1 (done) | A named game window can be played with keyboard input under a bounded contract: input is sent only while the configured window is the foreground window (with an optional focus step), only keys listed in the profile are ever pressed, every tick is paced by the profile interval (0.5–15 s in 20.1; 24.1 lowers the floor to 250 ms for vision and 100 ms for macro), and a run stops on a hard minute limit, a target score, a global `Ctrl+Alt+Shift+G` shortcut, the emergency stop, ten lost-window checks or three capture/keyboard failures. Vision profiles ask a multimodal model for one JSON action per screenshot (24.1 batches up to six) and reject anything outside the key allow-list; macro profiles replay a fixed `KEY@waitMs` sequence without a model. The score is read from a cropped score region through Windows OCR, never invented. Each finished run is stored as a training episode with its stop reason, best score and action log | `electron/game-core.cjs`, `electron/game-pilot.cjs`, `electron/main.cjs`, `electron/preload.cjs`, `src/pages/GamePilotPage.tsx`, `src/data/nav.ts` | `tests/unit/game-pilot.test.mjs`, `smoke:advanced` (real loop with fake desktop + recorded episode), e2e bridge check |
 
 ## Phase 21 — macOS and Linux adapters (21.1 done)
 
@@ -300,6 +300,12 @@ Status as of 2026-11-03: all five original phases are implemented in the v1.0.0 
 | Step | What it does | Where | Proof |
 | --- | --- | --- | --- |
 | 23.1 (done) | An A2A 0.3 JSON-RPC endpoint serves `message/send`, `tasks/get` and `tasks/cancel` with a public agent card, bearer authentication, a forced ORVEX header (so a web page cannot post to it), private-LAN-only answers, loopback or LAN binding and a 2-minute default timeout. Every task is stored in SQLite with direction and peer; a task interrupted by a restart is marked failed instead of looking alive. Saved peers keep a masked token view, can be probed for their card, and outbound tasks round-trip through the same JSON-RPC. Inbound text is answered by the configured chat model with a dedicated system prompt — peers cannot reach tools, files, desktop input, plugins or approvals. The agent also gets `a2a_send`, `a2a_tasks` and `a2a_peers` tools | `electron/a2a.cjs`, `electron/db.cjs`, `electron/main.cjs`, `electron/preload.cjs`, `electron/tools.cjs`, `src/pages/AdvancedPage.tsx` | `tests/unit/a2a.test.mjs` (9 checks), `smoke:advanced` (auth, card, text task, failure, cancel, peer round-trip, token rotation, restart normalization), e2e bridge check |
+
+## Phase 24 — Game Pilot fast mode (24.1 done)
+
+| Step | What it does | Where | Proof |
+| --- | --- | --- | --- |
+| 24.1 (done) | The per-tick model call, not the screenshot, was the bottleneck. A vision reply is now an ordered batch of 1–6 allowed keys (`{"actions":[...]}`) with a 40–2000 ms inter-key gap, so one model call drives several inputs; the vision interval floor drops to 250 ms (macro 100 ms). A camera frame is hashed (SHA-1) per tick and, while the screen is pixel-identical, the last batch is replayed without any model call — bounded to 1,200 idle repeats and still subject to the window, stop-key, security, capture, target and minute limits. Old single-action replies still parse, and every key is still checked against the allow-list before it is pressed | `electron/game-core.cjs`, `electron/game-pilot.cjs`, `electron/main.cjs`, `src/pages/GamePilotPage.tsx`, `src/types/desktop.d.ts` | `tests/unit/game-pilot.test.mjs` (23 checks), `smoke:advanced` (vision batch run with fake desktop), e2e bridge check |
 
 ## Forward-looking work (beyond v1.0.0)
 
@@ -324,7 +330,7 @@ These are deliberately not claimed as shipped:
 17. **Bounded spill retention.** Large tool outputs are kept for 7 days or 500 files (13.3); there is no user-facing setting yet, and the cap applies per data folder rather than per conversation.
 18. **Non-UIA controls.** Actionability, batching, waits and pixel-diff verification ship (14.1–14.4), but a custom-drawn control that exposes no UI Automation state can still change without a readable before/after; the pixel check reports "changed" without naming what changed.
 19. **Non-streaming requests have no stall watchdog.** The inter-chunk watchdog (13.7b) applies to streaming calls only; a non-stream request is governed solely by the whole-request timeout.
-20. **Game Pilot is keyboard-only and slow by design.** A vision tick is a screenshot plus a model call, paced at 1 s or slower, so it suits turn-based, puzzle, management and grinding loops rather than fast shooters. It cannot move the mouse, and score reading depends on Windows OCR plus a score region/pattern the user provides. Online games may treat automation as cheating; that risk belongs to the user.
+20. **Game Pilot is keyboard-only.** A vision tick is one screenshot plus one model call; fast mode (24.1) batches 1–6 keys per call, allows a 250 ms vision floor (100 ms macro) and replays the last batch without a model call while the frame is pixel-identical, up to 1,200 idle repeats. It still cannot move the mouse, and score reading depends on Windows OCR plus a score region/pattern the user provides. Model latency still caps twitch-game responsiveness — a local vision model is the next real step. Online games may treat automation as cheating; that risk belongs to the user.
 21. **Gameplay produces data, not a trained model.** Every pilot run is stored as an episode and can feed the training vault and skill scorer, but real fine-tuning still needs a curated dataset and suitable hardware; the pilot itself does not change the model's weights.
 
 ## Verification ledger (2026-11-04, Phase 17 build)
@@ -356,14 +362,14 @@ These are deliberately not claimed as shipped:
 | `smoke:window-ui` (live CDP window) | 38/38 |
 | Regression: `smoke:productivity` / `smoke:monitor` / `smoke:security` | 65/65 · 73/73 backend (CDP half needs a live window) · 54/55 (CDP half needs a live window) |
 
-## Verification ledger (2026-11-05, Phase 23 build)
+## Verification ledger (2026-11-05, Phase 24 build)
 
 | Suite | Result |
 | --- | --- |
-| `npm test` (unit + adversarial) | 471 passed / 2 skipped (40 files), including 17 Game Pilot, 9 A2A text/auth and the cross-platform adapter tests |
+| `npm test` (unit + adversarial) | 477 passed / 2 skipped (40 files), including 23 Game Pilot, 9 A2A text/auth and the cross-platform adapter tests |
 | `npm run test:e2e:source` | 127/127 (28 nav destinations, 38 bridge modules, 5 advanced groups) |
 | `npm run test:e2e` (packaged) | 127/127 against `release/win-unpacked/ORVEX.exe` |
-| `npm run smoke:advanced` (backend) | 140/140, including the signed catalog envelope and the A2A server, peer round-trip and restart normalization |
+| `npm run smoke:advanced` (backend) | 141/141, including the signed catalog envelope, the A2A server, and a vision batch run that presses every key from one model reply |
 | `npm run dist:dir` | packaged cleanly (unsigned, no code-signing certificate) |
 
 Platform adapters (21.1) are unit-tested on Windows only; a live macOS/Linux run is not part of this ledger.

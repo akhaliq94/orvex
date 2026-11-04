@@ -651,14 +651,14 @@ gamePilot.init({
             `Allowed keys: ${allowed}`,
             `Recent actions:\n${trail}`,
             `The screenshot is ${shot.width || '?'}x${shot.height || '?'} pixels.`,
-            'Return exactly one JSON object.',
+            'Return exactly one JSON object. Prefer an ordered {"actions":[...]} batch of 1-6 keys with waitMs between them, limited to what this screenshot justifies.',
           ].join('\n'),
           images: [{ mime: image.mime, data: image.data }],
         },
       ],
       task: 'vision',
       temperature: 0,
-      maxTokens: 220,
+      maxTokens: 400,
     });
     return reply.text;
   },

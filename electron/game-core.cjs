@@ -16,20 +16,24 @@ const MAX_PROFILES = 20;
 const MAX_ACTIONS = 12;
 const MAX_MACRO_STEPS = 20;
 const MAX_REGION = 10000;
-const MIN_INTERVAL_MS = 500;
+const MIN_INTERVAL_MS = 100;
 const MAX_INTERVAL_MS = 15000;
-const VISION_MIN_INTERVAL_MS = 1000;
+const VISION_MIN_INTERVAL_MS = 250;
+const MAX_BATCH = 6;
+const MIN_ACT_MS = 40;
+const MAX_ACT_MS = 2000;
 const MAX_MINUTES = 180;
 
 const GAME_SYSTEM = [
   'You are ORVEX Game Pilot, playing a game on the user\'s screen through keyboard input only.',
   'Look only at the supplied screenshot. Never claim a score, enemy, item or menu that is not visible in it.',
   'You may only press keys from the allowed list. Mouse input is not available.',
-  'Reply with exactly one JSON object and no prose:',
-  '  {"action":"key","key":"<one allowed key>","reason":"<short>"}',
+  'Reply with exactly one JSON object and no prose. Fast runs use an ordered batch:',
+  '  {"actions":[{"key":"<allowed key>","waitMs":<0-2000>,"reason":"<short>"}, ...]} — 1 to 6 keys you expect to press before the next screenshot',
   '  {"action":"wait","ms":<250-10000>,"reason":"<short>"} — use while a screen is loading',
   '  {"action":"stop","reason":"<short>"} — only when the game is over, paused, or the window is not the game',
-  'Prefer the action that most directly advances the stated goal. If the screenshot is unclear, wait instead of guessing.',
+  'Keep the batch short, ordered and justified by this screenshot; a later action must not assume something the screenshot does not show.',
+  'Prefer the actions that most directly advance the stated goal. If the screenshot is unclear, wait instead of guessing.',
 ].join('\n');
 
 function clip(value, max) {
@@ -187,6 +191,58 @@ function parseDecision(raw, allowedKeys = []) {
   return { type: 'key', key, note: reason };
 }
 
+/**
+ * Parses a fast-run reply: either the classic single action or an ordered
+ * `actions` batch. Unknown keys are dropped instead of guessed at, waits are
+ * clamped, and a stop inside a batch stops after the actions that precede it.
+ */
+function parseBatch(raw, allowedKeys = [], options = {}) {
+  const json = typeof raw === 'object' && raw ? raw : extractJson(raw);
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  const allowed = (Array.isArray(allowedKeys) ? allowedKeys : [])
+    .map((key) => normalizeKeyText(key))
+    .filter(Boolean);
+  const max = Math.max(1, Math.min(MAX_BATCH, Math.round(Number(options.max)) || MAX_BATCH));
+  const fallbackWait = intIn(options.actMs, MIN_ACT_MS, MAX_ACT_MS, 120);
+  const stopReason = clip(json.reason ?? json.why ?? '', 200);
+  const kind = String(json.action ?? json.type ?? '').trim().toLowerCase();
+
+  if (['stop', 'done', 'quit'].includes(kind)) {
+    return { type: 'stop', reason: stopReason || 'The model stopped the run.' };
+  }
+  if (['wait', 'sleep'].includes(kind)) {
+    return { type: 'batch', actions: [{ type: 'wait', ms: intIn(json.ms ?? json.waitMs ?? json.seconds * 1000, 250, 10000, 750) }] };
+  }
+
+  const entries = Array.isArray(json.actions) ? json.actions : [json];
+  const actions = [];
+  let stopAfter = false;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const entryKind = String(entry.action ?? entry.type ?? 'key').trim().toLowerCase();
+    if (['stop', 'done', 'quit'].includes(entryKind)) {
+      stopAfter = true;
+      break;
+    }
+    if (['wait', 'sleep'].includes(entryKind)) {
+      actions.push({ type: 'wait', ms: intIn(entry.ms ?? entry.waitMs ?? entry.seconds * 1000, 250, 10000, 750) });
+    } else {
+      if (!allowed.length) continue;
+      const key = normalizeKeyText(entry.key ?? entry.keys ?? entry.press ?? entry.combo);
+      if (!key || !allowed.includes(key)) continue;
+      actions.push({
+        type: 'key',
+        key,
+        waitMs: intIn(entry.waitMs ?? entry.wait ?? fallbackWait, MIN_ACT_MS, MAX_ACT_MS, fallbackWait),
+        note: clip(entry.reason ?? entry.note ?? stopReason, 160),
+      });
+    }
+    if (actions.length >= max) break;
+  }
+  if (!actions.length) return null;
+  return { type: 'batch', actions, stopAfter, reason: stopReason };
+}
+
 function normalizeAction(input) {
   if (!input || typeof input !== 'object') return null;
   const key = normalizeKeyText(input.key ?? input.keys);
@@ -276,6 +332,8 @@ function normalizeProfile(input = {}) {
     scoreRegex,
     targetScore,
     intervalMs,
+    actMs: intIn(input.actMs, MIN_ACT_MS, MAX_ACT_MS, 120),
+    reuseOnIdle: input.reuseOnIdle !== false,
     maxMinutes: intIn(input.maxMinutes, 1, MAX_MINUTES, 30),
     autoFocus: input.autoFocus !== false,
     display: clip(input.display, 40),
@@ -321,6 +379,9 @@ module.exports = {
   MAX_PROFILES,
   MAX_ACTIONS,
   MAX_MACRO_STEPS,
+  MAX_BATCH,
+  MIN_ACT_MS,
+  MAX_ACT_MS,
   MIN_INTERVAL_MS,
   MAX_INTERVAL_MS,
   VISION_MIN_INTERVAL_MS,
@@ -330,6 +391,7 @@ module.exports = {
   formatRegion,
   parseScore,
   parseDecision,
+  parseBatch,
   extractJson,
   compileScorePattern,
   publicProfile,

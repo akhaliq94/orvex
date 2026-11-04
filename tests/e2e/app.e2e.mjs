@@ -188,7 +188,8 @@ async function main() {
       return {
         stateOk: !!(before && before.ok && before.data && typeof before.data.current === 'string' && typeof before.data.portable === 'boolean'),
         saved: !!(saved && saved.ok && saved.data.repo === 'acme/orvex-releases'),
-        cleared: !!(cleared && cleared.ok && cleared.data.repo === ''),
+        // An emptied setting falls back to the built-in public release channel.
+        cleared: !!(cleared && cleared.ok && cleared.data.repo === before.data.repo && cleared.data.repo.includes('/')),
         auto: !!(auto && auto.ok && auto.data.autoCheck === true),
       }
     })
