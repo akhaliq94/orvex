@@ -13,6 +13,7 @@
     "desktop:dev": "node scripts/electron-dev.mjs",
     "desktop": "npm run build && electron .",
     "icon": "electron scripts/make-icon.cjs",
+    "release": "node scripts/release.mjs",
     "smoke:gateway": "node scripts/run-smoke.mjs",
     "smoke:ui": "node scripts/smoke-ui.cjs",
     "smoke:ipc": "node scripts/smoke-llm-ipc.cjs",
