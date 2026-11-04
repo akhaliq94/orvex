@@ -14,6 +14,7 @@ const crypto = require('node:crypto');
 const db = require('./db.cjs');
 const core = require('./update-core.cjs');
 
+const DEFAULT_REPO = 'akhaliq94/orvex-releases';
 const REPO_KEY = 'updater.repo';
 const AUTO_KEY = 'updater.autoCheck';
 const LAST_KEY = 'updater.last';
@@ -60,7 +61,8 @@ function writeLast(value) {
 }
 
 function repoOf() {
-  return String(db.getSetting(REPO_KEY, '') || '');
+  const saved = String(db.getSetting(REPO_KEY, '') || '').trim();
+  return saved || DEFAULT_REPO;
 }
 
 function autoCheckOf() {
