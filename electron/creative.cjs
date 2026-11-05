@@ -1070,33 +1070,54 @@ async function synthesize({ url, key, path: synthPath, body, ext, name } = {}) {
 
 const HEYGEN_ORIGIN = 'https://api.heygen.com';
 const HEYGEN_MODELS = new Set(['heygen-voice-1', 'heygen-voice-1-turbo', 'heygen-voice-1-turbo-free']);
+const HEYGEN_PAGE_SIZE = 100;
+const HEYGEN_MAX_PAGES = 60;
+const HEYGEN_LIST_BUDGET_MS = 45000;
 
 async function heygenVoices({ key, type = 'public' } = {}) {
   requireReady();
   const apiKey = String(key || '').trim();
   if (!apiKey) throw new Error('Add your HeyGen API key in Settings → Voice first.');
   const scope = type === 'private' ? 'private' : 'public';
-  const { json } = await requestJson(`${HEYGEN_ORIGIN}/v3/models/audio/voices?type=${scope}`, {
-    method: 'GET',
-    headers: { 'x-api-key': apiKey, accept: 'application/json' },
-    timeoutMs: 30000,
-  });
-  const raw = json && json.data !== undefined ? json.data : json;
-  const rows = Array.isArray(raw) ? raw : Array.isArray(raw && raw.voices) ? raw.voices : [];
-  const voices = rows
-    .map((v) => {
+  const started = Date.now();
+  const byId = new Map();
+  let token = '';
+  let pages = 0;
+  let complete = false;
+  while (pages < HEYGEN_MAX_PAGES) {
+    const query = `type=${scope}&limit=${HEYGEN_PAGE_SIZE}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+    const { json } = await requestJson(`${HEYGEN_ORIGIN}/v3/models/audio/voices?${query}`, {
+      method: 'GET',
+      headers: { 'x-api-key': apiKey, accept: 'application/json' },
+      timeoutMs: 20000,
+    });
+    const raw = json && json.data !== undefined ? json.data : json;
+    const rows = Array.isArray(raw) ? raw : Array.isArray(raw && raw.voices) ? raw.voices : [];
+    for (const v of rows) {
       const voiceId = String((v && (v.voice_id || v.id)) || '');
-      return {
+      if (!voiceId || byId.has(voiceId)) continue;
+      byId.set(voiceId, {
         voiceId,
         name: String((v && (v.name || v.voice_name)) || voiceId),
         language: String((v && (v.language || v.locale)) || ''),
         gender: String((v && v.gender) || ''),
         preview: String((v && (v.preview_audio_url || v.preview_url)) || ''),
-      };
-    })
-    .filter((v) => v.voiceId);
+      });
+    }
+    pages += 1;
+    const meta = json && (json.has_more !== undefined || json.next_token !== undefined) ? json : raw || {};
+    const hasMore = !!(meta && meta.has_more);
+    const next = String((meta && meta.next_token) || '');
+    if (!hasMore || !next) {
+      complete = true;
+      break;
+    }
+    if (Date.now() - started > HEYGEN_LIST_BUDGET_MS) break;
+    token = next;
+  }
+  const voices = [...byId.values()];
   if (!voices.length) throw new Error('HeyGen returned no voices for this key.');
-  return { voices, type: scope };
+  return { voices, type: scope, pages, complete };
 }
 
 async function heygenSpeak({ key, text, voiceId, model, language, speed, pitch, expressiveness, seed } = {}) {

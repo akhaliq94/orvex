@@ -3432,7 +3432,7 @@ export type OrvexBridge = {
       name?: string
     }) => Promise<IpcResult<{ asset: OrvexMediaAsset; bytes: number; contentType: string | null; synthPath: string | null }>>
     heygenVoices: (payload?: { type?: 'public' | 'private' }) => Promise<
-      IpcResult<{ voices: { voiceId: string; name: string; language: string; gender: string; preview: string }[]; type: string }>
+      IpcResult<{ voices: { voiceId: string; name: string; language: string; gender: string; preview: string }[]; type: string; pages?: number; complete?: boolean }>
     >
     heygenTts: (payload: {
       text: string

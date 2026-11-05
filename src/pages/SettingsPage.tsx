@@ -1623,6 +1623,7 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
   const [heygenSaved, setHeygenSaved] = useState(false)
   const [heygenMsg, setHeygenMsg] = useState('')
   const [heygenVoices, setHeygenVoices] = useState<HeygenVoice[]>([])
+  const [heygenFilter, setHeygenFilter] = useState('')
   const [voicesBusy, setVoicesBusy] = useState(false)
 
   useEffect(() => {
@@ -1668,6 +1669,15 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
           },
         ]
       : []
+  const heygenQuery = heygenFilter.trim().toLowerCase()
+  const heygenMatches = heygenQuery
+    ? heygenVoiceOptions.filter((v) => `${v.name} ${v.language} ${v.gender}`.toLowerCase().includes(heygenQuery))
+    : heygenVoiceOptions
+  const HEYGEN_RENDER_CAP = 300
+  const heygenShown = heygenMatches.slice(0, HEYGEN_RENDER_CAP)
+  const heygenSelected = cfg.heygenVoiceId && !heygenShown.some((v) => v.voiceId === cfg.heygenVoiceId)
+    ? heygenVoiceOptions.find((v) => v.voiceId === cfg.heygenVoiceId)
+    : undefined
 
   const saveKey = async () => {
     const endpoint = sttTarget(cfg)?.url || cfg.serverUrl.trim() || undefined
@@ -1788,7 +1798,12 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
               value={cfg.heygenVoiceId}
               onChange={(e) => setCfg({ heygenVoiceId: e.target.value })}
             >
-              {heygenVoiceOptions.map((v) => (
+              {heygenSelected && (
+                <option key={heygenSelected.voiceId} value={heygenSelected.voiceId}>
+                  {heygenSelected.name}{heygenSelected.language ? ` · ${heygenSelected.language}` : ''}{heygenSelected.gender ? ` · ${heygenSelected.gender}` : ''}
+                </option>
+              )}
+              {heygenShown.map((v) => (
                 <option key={v.voiceId} value={v.voiceId}>
                   {v.name}{v.language ? ` · ${v.language}` : ''}{v.gender ? ` · ${v.gender}` : ''}
                 </option>
@@ -1799,6 +1814,24 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
             </button>
           </div>
         </div>
+        {heygenVoices.length > 0 && (
+          <div className="field-row">
+            <label className="field-label" htmlFor="heygen-voice-filter">Find a voice</label>
+            <input
+              id="heygen-voice-filter"
+              className="text-input"
+              value={heygenFilter}
+              onChange={(e) => setHeygenFilter(e.target.value)}
+              placeholder="name, language or gender"
+            />
+          </div>
+        )}
+        {heygenVoices.length > 0 && (
+          <p className="settings-note">
+            {heygenMatches.length} of {heygenVoiceOptions.length} voices match
+            {heygenMatches.length > HEYGEN_RENDER_CAP ? ` — showing the first ${HEYGEN_RENDER_CAP}, keep typing to narrow` : ''}.
+          </p>
+        )}
         <div className="field-row">
           <label className="field-label" htmlFor="heygen-language">Language</label>
           <input
