@@ -1680,7 +1680,7 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
     : undefined
 
   const saveKey = async () => {
-    const endpoint = sttTarget(cfg)?.url || cfg.serverUrl.trim() || undefined
+    const endpoint = sttTarget(cfg)?.url || undefined
     const res = await saveSttKey(sttKey, endpoint)
     setSttMsg(res.detail)
     if (res.ok) {
@@ -2026,8 +2026,8 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
           />
         </div>
         <p className="settings-note">
-          For a local VoiceStudio-style server leave the endpoint URL blank: ORVEX then uses the server URL above plus
-          this path. ASR and TTS can share the same server.
+          For a local VoiceStudio-style server leave the endpoint URL blank: when the TTS engine is a local server engine
+          (not browser or HeyGen) ORVEX uses the server URL above plus this path. ASR and TTS can share the same server.
         </p>
 
         <div className="field-inline" style={{ marginTop: 10 }}>

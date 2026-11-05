@@ -366,7 +366,7 @@ These are deliberately not claimed as shipped:
 
 | Suite | Result |
 | --- | --- |
-| `npm test` (unit + adversarial) | 482 passed / 2 skipped (41 files), including 23 Game Pilot, 9 A2A text/auth, 5 HeyGen voice-page and the cross-platform adapter tests |
+| `npm test` (unit + adversarial) | 493 passed / 2 skipped (43 files), including 23 Game Pilot, 9 A2A text/auth, 5 HeyGen voice-page, 11 STT target/proxy and the cross-platform adapter tests |
 | `npm run test:e2e:source` | 127/127 (28 nav destinations, 38 bridge modules, 5 advanced groups) |
 | `npm run test:e2e` (packaged) | 127/127 against `release/win-unpacked/ORVEX.exe` |
 | `npm run smoke:advanced` (backend) | 141/141, including the signed catalog envelope, the A2A server, and a vision batch run that presses every key from one model reply |

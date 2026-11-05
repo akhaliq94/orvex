@@ -38,6 +38,7 @@ const research = require('./research.cjs');
 const memoryStore = require('./memory.cjs');
 const filesStore = require('./files.cjs');
 const creative = require('./creative.cjs');
+const sttProxy = require('./stt-proxy.cjs');
 const guardrails = require('./guardrails.cjs');
 const vault = require('./vault.cjs');
 const permissions = require('./permissions.cjs');
@@ -2814,49 +2815,8 @@ function registerIpc() {
     const target = String(url || '').trim();
     const net = security.networkPolicyBlock(target);
     if (net) throw new Error(net);
-    let parsed;
-    try {
-      parsed = new URL(target);
-    } catch {
-      throw new Error('The transcription endpoint URL is not valid.');
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only http(s) transcription endpoints are supported.');
-    const view =
-      audio instanceof ArrayBuffer
-        ? new Uint8Array(audio)
-        : ArrayBuffer.isView(audio)
-          ? new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength)
-          : null;
-    if (!view || !view.byteLength) throw new Error('No audio was received.');
-    if (view.byteLength > 40 * 1024 * 1024) throw new Error('That recording is larger than 40 MB.');
-
     const key = boundSecretOrEmpty('stt', target);
-    const mime = String(type || 'audio/webm');
-    const ext = mime.includes('wav') ? 'wav' : mime.includes('ogg') ? 'ogg' : mime.includes('mp4') ? 'm4a' : 'webm';
-    const form = new FormData();
-    form.append('file', new Blob([view], { type: mime }), `clip.${ext}`);
-    form.append('model', String(model || 'whisper-1'));
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(Math.max(Number(timeoutMs) || 45000, 5000), 120000));
-    try {
-      const res = await fetch(target, {
-        method: 'POST',
-        headers: key ? { authorization: `Bearer ${key}` } : {},
-        body: form,
-        signal: controller.signal,
-      });
-      const raw = await res.text().catch(() => '');
-      if (!res.ok) throw new Error(`HTTP ${res.status}${raw ? `: ${raw.slice(0, 160)}` : ''}`);
-      try {
-        const data = JSON.parse(raw || '{}');
-        return { text: String(data.text || '').trim() };
-      } catch {
-        return { text: '' };
-      }
-    } finally {
-      clearTimeout(timer);
-    }
+    return sttProxy.transcribeAudio({ url: target, key, audio, type, model, timeoutMs });
   });
   handle('orvex:media:inspect3d', (payload = {}) => creative.inspect3D(payload || {}));
   handle('orvex:media:saveText', (payload = {}) => creative.saveText(payload || {}));

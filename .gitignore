@@ -14,7 +14,7 @@ tsconfig.tsbuildinfo
 
 # never commit local secrets or signing keys
 secrets.json
-data/
-keys/
+/data/
+/keys/
 *.pem
 *.key
