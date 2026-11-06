@@ -18,12 +18,13 @@ import {
 } from 'lucide-react'
 import PageShell from './PageShell'
 import { useProviders } from '../hooks/useProviders'
-import { useHumanAgent, useHumanStream } from '../hooks/useHumanAgent'
+import { useHumanAgent } from '../hooks/useHumanAgent'
 import { useLLM, type LLMMessage } from '../hooks/useLLM'
 import { loadConversations, saveConversations, upsertConversation, formatTime, titleFrom, type Conversation } from '../data/memory'
 import { buildCandidates, orderForTask, pickLocal } from '../data/routing'
 import { AGENT_PROFILES, HUMANITY_PROMPT } from '../data/agents'
-import { speak, stopSpeaking, useVoiceSettings } from '../data/voice'
+import { beginReplySpeech, speak, stopSpeaking, useVoiceSettings } from '../data/voice'
+import type { ReplySpeech } from '../data/voice'
 import { logFailure, pushNotification } from '../data/stores'
 import type { Voice } from '../hooks/useVoice'
 import type { OrvexAgentEvent } from '../types/desktop'
@@ -38,7 +39,8 @@ type Props = {
   initialAgentId?: string | null
   initialDraft?: string | null
   voice: Voice
-  onToggleListening: () => void
+  handsFree: boolean
+  onHandsFreeChange: (enabled: boolean) => void
 }
 
 const greetingFor = (p: { name: string; model: string } | null) =>
@@ -46,7 +48,6 @@ const greetingFor = (p: { name: string; model: string } | null) =>
     ? `Connected to ${p.name} (${p.model}). Agent mode is on — tell me what to do on your PC: open apps, drive the browser, work with files. Tap the brain icon to switch to plain chat.`
     : 'No provider yet. Add one in Settings → Providers so I can act on your PC — or keep chatting on the local offline brain.'
 
-const HANDS_FREE_KEY = 'orvex-handsfree'
 const AGENT_MODE_KEY = 'orvex-chat-agent'
 const FULL_AUTO_KEY = 'orvex-fullauto'
 
@@ -67,19 +68,24 @@ export default function ChatPage({
   initialAgentId,
   initialDraft,
   voice,
-  onToggleListening,
+  handsFree,
+  onHandsFreeChange,
 }: Props) {
   const { providers, activeId, active } = useProviders()
   const [activeAgentId, setActiveAgentId] = useState(initialAgentId ?? 'general')
-  const { thinking, think, typeOut, respondLocally, clear: clearHuman } = useHumanAgent(activeAgentId)
+  const { respondLocally } = useHumanAgent(activeAgentId)
   const { send, stop: stopLLM } = useLLM()
   const { cfg: voiceCfg, setCfg: setVoiceCfg } = useVoiceSettings()
 
   const [messages, setMessages] = useState<Msg[]>(() => [{ role: 'assistant', text: greetingFor(active) }])
   const [input, setInput] = useState('')
-  const [typing, setTyping] = useState(false)
+  const [typing, setTypingState] = useState(false)
+  const typingRef = useRef(false)
+  const setTyping = useCallback((value: boolean) => {
+    typingRef.current = value
+    setTypingState(value)
+  }, [])
   const [statusLine, setStatusLine] = useState<string>('')
-  const [handsFree, setHandsFree] = useState(() => readFlag(HANDS_FREE_KEY, '0') === '1')
   const [agentMode, setAgentMode] = useState(() => readFlag(AGENT_MODE_KEY, '1') !== '0')
   const [fullAuto, setFullAuto] = useState(() => readFlag(FULL_AUTO_KEY, '0') === '1')
   const [agentSteps, setAgentSteps] = useState<AgentStep[]>([])
@@ -108,6 +114,10 @@ export default function ChatPage({
   const turnHistoryRef = useRef<Msg[] | null>(null)
   const turnMetaRef = useRef<TurnMeta | null>(null)
   const turnCancelledRef = useRef(false)
+  const turnSequenceRef = useRef(0)
+  const speechSequenceRef = useRef(0)
+  /** speech for the reply that is still streaming, or null for one-shot speech */
+  const turnSpeechRef = useRef<{ sequence: number; stream: ReplySpeech } | null>(null)
   const viewingConvRef = useRef<string | null>(null)
   /** set when the turn came in through the wake word, so the mic re-arms after it */
   const wakeTurnRef = useRef(false)
@@ -123,20 +133,6 @@ export default function ChatPage({
     setMessages(next)
   }, [])
 
-  const shownRef = useRef('')
-  const human = useHumanStream(activeAgentId, (t) => {
-    shownRef.current = t
-    const conv = turnConvRef.current
-    const snap = turnHistoryRef.current
-    if (!conv || !snap) return
-    // Keep the turn's own transcript current even while another chat is shown.
-    turnHistoryRef.current = [...snap.slice(0, -1), { role: 'assistant', text: t }]
-    if (viewingConvRef.current !== conv) return
-    const next = turnHistoryRef.current
-    if (!next) return
-    messagesRef.current = next
-    setMessages(next)
-  })
 
   useEffect(() => {
     const list = loadConversations()
@@ -185,10 +181,6 @@ export default function ChatPage({
   }, [voice.transcript])
 
   const sendRef = useRef<(raw: string) => Promise<void>>(async () => {})
-  const typingRef = useRef(false)
-  useEffect(() => {
-    typingRef.current = typing
-  }, [typing])
 
   // Hands-free: the voice hook fires once the speaker pauses, and that turn is
   // sent without anyone touching the keyboard. A wake-word turn is always sent,
@@ -210,7 +202,7 @@ export default function ChatPage({
 
   // Hands-free survives reloads, so re-open the mic when the page comes back.
   useEffect(() => {
-    if (handsFree && voice.status === 'idle') void voice.start()
+    if (handsFree) void voice.start()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handsFree])
 
@@ -225,6 +217,9 @@ export default function ChatPage({
   useEffect(() => {
     return () => {
       turnCancelledRef.current = true
+      turnSequenceRef.current += 1
+      speechSequenceRef.current += 1
+      stopSpeaking()
       stopLLM()
       if ((awaitingAgentRef.current || agentActiveRef.current) && bridge) void bridge.agent.stop()
       voice.stop()
@@ -277,10 +272,11 @@ export default function ChatPage({
   const deleteConv = (id: string) => {
     if (turnConvRef.current === id) {
       turnCancelledRef.current = true
+      turnSequenceRef.current += 1
+      speechSequenceRef.current += 1
+      stopSpeaking()
       stopLLM()
       if (agentActiveRef.current && bridge) void bridge.agent.stop()
-      clearHuman()
-      human.reset()
       setTyping(false)
       setStatusLine('')
       turnConvRef.current = null
@@ -309,26 +305,108 @@ export default function ChatPage({
 
   /** Speak a reply and report failures instead of swallowing them. */
   const speakReply = useCallback((text: string, then?: () => void) => {
-    voiceApiRef.current.markSpeaking(true)
-    void speak(text, voiceCfgRef.current)
+    const sequence = ++speechSequenceRef.current
+    voiceApiRef.current.markSpeaking(false)
+    voiceApiRef.current.setReplyPhase('preparing')
+    void speak(text, voiceCfgRef.current, () => {
+      if (speechSequenceRef.current !== sequence) return
+      voiceApiRef.current.setReplyPhase(null)
+      voiceApiRef.current.markSpeaking(true)
+    })
       .then((r) => {
-        if (r.ok) return
+        if (r.ok || speechSequenceRef.current !== sequence) return
         logFailure('Chat · speak', r.detail)
         pushNotification({ title: 'Speech failed', body: r.detail, kind: 'voice' })
       })
       .finally(() => {
+        if (speechSequenceRef.current !== sequence) return
         voiceApiRef.current.markSpeaking(false)
+        voiceApiRef.current.setReplyPhase(null)
         then?.()
       })
   }, [])
+
+  /**
+   * Open speech for a reply that is still arriving. Each finished sentence is
+   * spoken as it lands, so the answer is heard before the model has written
+   * the last word; `completeSpeech` says whatever is left.
+   */
+  const beginTurnSpeech = useCallback(() => {
+    turnSpeechRef.current = null
+    if (!voiceCfgRef.current.autoSpeak) return
+    const sequence = ++speechSequenceRef.current
+    const api = voiceApiRef.current
+    let heard = false
+    turnSpeechRef.current = {
+      sequence,
+      stream: beginReplySpeech(voiceCfgRef.current, () => {
+        if (speechSequenceRef.current !== sequence || heard) return
+        heard = true
+        api.setReplyPhase(null)
+        api.markSpeaking(true)
+      }),
+    }
+  }, [])
+
+  const feedTurnSpeech = useCallback((textSoFar: string) => {
+    if (speechSequenceRef.current !== turnSpeechRef.current?.sequence) return
+    turnSpeechRef.current?.stream.push(textSoFar)
+  }, [])
+
+  /** Write live model text into the assistant slot this turn opened. */
+  const streamTurnText = useCallback((text: string) => {
+    const conv = turnConvRef.current
+    const snap = turnHistoryRef.current
+    if (!conv || !snap) return
+    const next: Msg[] = [...snap.slice(0, -1), { role: 'assistant', text }]
+    turnHistoryRef.current = next
+    if (viewingConvRef.current === conv) {
+      messagesRef.current = next
+      setMessages(next)
+    }
+  }, [])
+
+  /** Resolve the turn's early speech, or start one-shot speech instead. */
+  const completeSpeech = useCallback((text: string, then?: () => void) => {
+    const turn = turnSpeechRef.current
+    turnSpeechRef.current = null
+    if (!turn) {
+      speakReply(text, then)
+      return
+    }
+    const api = voiceApiRef.current
+    api.markSpeaking(false)
+    api.setReplyPhase('preparing')
+    void turn.stream
+      .finish(text)
+      .then((r) => {
+        if (r.ok || speechSequenceRef.current !== turn.sequence) return
+        logFailure('Chat · speak', r.detail)
+        pushNotification({ title: 'Speech failed', body: r.detail, kind: 'voice' })
+      })
+      .finally(() => {
+        if (speechSequenceRef.current !== turn.sequence) return
+        api.markSpeaking(false)
+        api.setReplyPhase(null)
+        then?.()
+      })
+  }, [speakReply])
 
   /** Speak the reply, then put the mic back the way this turn found it. */
   const finishTurnVoice = useCallback(
     (text: string) => {
       const api = voiceApiRef.current
+      api.setReplyPhase(null)
       const handsFreeOn = handsFreeRef.current
       const wasWake = wakeTurnRef.current
       wakeTurnRef.current = false
+      const early = turnSpeechRef.current !== null
+      if (early) {
+        // Sentences are already being heard; keep the mic closed until they end.
+        api.pauseListening()
+        completeSpeech(text, handsFreeOn || wasWake ? () => api.resumeListening() : undefined)
+        return
+      }
       if (handsFreeOn) {
         // Speak the reply, then reopen the mic so the next turn needs no click.
         api.pauseListening()
@@ -343,11 +421,18 @@ export default function ChatPage({
       }
       if (voiceCfgRef.current.autoSpeak) speakReply(text)
     },
-    [speakReply],
+    [speakReply, completeSpeech],
   )
 
   /** Give the mic back after a turn that failed before producing a reply. */
   const resumeMicAfterTurn = useCallback(() => {
+    voiceApiRef.current.setReplyPhase(null)
+    // Anything this turn had started saying is stale from here on.
+    if (turnSpeechRef.current) {
+      speechSequenceRef.current += 1
+      turnSpeechRef.current = null
+      stopSpeaking()
+    }
     const wasWake = wakeTurnRef.current
     wakeTurnRef.current = false
     if (handsFreeRef.current || wasWake) voiceApiRef.current.resumeListening()
@@ -382,6 +467,15 @@ export default function ChatPage({
         setApproval(null)
         setTyping(true)
         setStatusLine('Planning…')
+        // The run answers as it goes from here, so speech opens now too.
+        beginTurnSpeech()
+        return
+      }
+      if (ev.type === 'answer_delta') {
+        if (turnCancelledRef.current) return
+        setStatusLine('Receiving…')
+        streamTurnText(ev.text)
+        feedTurnSpeech(ev.text)
         return
       }
       if (ev.type === 'status') {
@@ -455,11 +549,12 @@ export default function ChatPage({
         } else if (!turnCancelledRef.current) {
           applyMessages((m) => [...m.slice(0, -1), { role: 'assistant', text }])
         }
-        finishTurnVoice(text)
+        if (turnCancelledRef.current || ev.cancelled) resumeMicAfterTurn()
+        else finishTurnVoice(text)
       }
     })
     return off
-  }, [bridge, applyMessages, speakReply, persistTurn, finishTurnVoice])
+  }, [bridge, applyMessages, speakReply, persistTurn, finishTurnVoice, resumeMicAfterTurn, beginTurnSpeech, feedTurnSpeech, streamTurnText])
 
   const answerApproval = async (allow: boolean) => {
     if (!bridge || !approval) return
@@ -496,9 +591,16 @@ export default function ChatPage({
 
   const sendMsg = async (raw: string) => {
     const text = raw.trim()
-    if (!text || typing) return
+    if (!text || typingRef.current) return
 
+    typingRef.current = true
+    const sequence = ++turnSequenceRef.current
+    speechSequenceRef.current += 1
+    turnSpeechRef.current = null
     stopSpeaking()
+    voice.markSpeaking(false)
+    voice.setReplyPhase('thinking')
+    if (handsFreeRef.current || wakeTurnRef.current) voice.pauseListening()
     turnCancelledRef.current = false
     let convId = conversationId
     if (!convId) {
@@ -527,7 +629,10 @@ export default function ChatPage({
     setStatusLine('')
 
     const currentAgent = AGENT_PROFILES.find((a) => a.id === activeAgentId) ?? AGENT_PROFILES[0]
-    const sysPrompt = `${currentAgent.persona}\n\n${HUMANITY_PROMPT}`
+    const voicePrompt = handsFreeRef.current || wakeTurnRef.current
+      ? 'This is a live voice conversation. Match the user’s language. For ordinary conversation, answer naturally in one or two short sentences without markdown unless they ask for detail. Use tools only when the request needs an action or current information.'
+      : ''
+    const sysPrompt = `${currentAgent.persona}\n\n${HUMANITY_PROMPT}\n\n${voicePrompt}`
 
     const historyMsgs: LLMMessage[] = priorMsgs
       .slice(-10)
@@ -559,7 +664,7 @@ export default function ChatPage({
         .slice(-6)
         .map((m) => `${m.role === 'user' ? 'User' : 'You'}: ${m.text.replace(/\s+/g, ' ').slice(0, 500)}`)
         .join('\n')
-      const goal = `${context ? `Conversation so far:\n${context}\n\nNow do this: ` : ''}${text}`
+      const goal = `${voicePrompt ? `${voicePrompt}\n\n` : ''}${context ? `Conversation so far:\n${context}\n\nNow do this: ` : ''}${text}`
       awaitingAgentRef.current = true
       agentRunRef.current = null
       agentActiveRef.current = true
@@ -602,38 +707,17 @@ export default function ChatPage({
     }
 
     if (!active) {
-      await think((line) => setStatusLine(line))
-      if (turnCancelledRef.current) {
-        setTyping(false)
-        setStatusLine('')
-        resumeMicAfterTurn()
-        return
-      }
       setTyping(false)
       const local = respondLocally(text)
-      await typeOut(local, (partial) => {
-        if (turnCancelledRef.current) return
-        writeTurn(partial)
-      })
-      if (turnCancelledRef.current) return
       writeTurn(local)
       persistCurrentTurn()
       finishTurnVoice(local)
       return
     }
 
-    let firstToken = true
-    human.reset()
-    shownRef.current = ''
-
-    await think((line) => setStatusLine(line))
-    if (turnCancelledRef.current) {
-      setTyping(false)
-      setStatusLine('')
-      resumeMicAfterTurn()
-      return
-    }
-    setStatusLine('')
+    let streamedText = ''
+    setStatusLine('Waiting for the model…')
+    beginTurnSpeech()
 
     await send({
       provider: active,
@@ -642,25 +726,22 @@ export default function ChatPage({
       messages: historyMsgs,
       system: sysPrompt,
       onDelta: (delta) => {
-        if (turnCancelledRef.current) return
-        if (firstToken) {
-          firstToken = false
-          setTyping(false)
-          setStatusLine('')
-        }
-        human.feed(delta)
+        if (turnCancelledRef.current || turnSequenceRef.current !== sequence) return
+        setStatusLine('Receiving…')
+        streamedText += delta
+        writeTurn(streamedText)
+        feedTurnSpeech(streamedText)
       },
       onDone: (done) => {
-        if (turnCancelledRef.current) return
-        const rest = done.slice(shownRef.current.length)
-        human.flush(rest)
+        if (turnCancelledRef.current || turnSequenceRef.current !== sequence) return
         writeTurn(done)
+        setStatusLine('')
         persistCurrentTurn()
         setTyping(false)
         finishTurnVoice(done)
       },
       onError: (msg) => {
-        if (turnCancelledRef.current) return
+        if (turnCancelledRef.current || turnSequenceRef.current !== sequence) return
         setTyping(false)
         writeTurn(`Error: ${msg}`)
         persistCurrentTurn()
@@ -688,25 +769,15 @@ export default function ChatPage({
     sendRef.current = sendMsg
   })
 
-  const toggleHandsFree = () => {
-    const next = !handsFree
-    setHandsFree(next)
-    try {
-      localStorage.setItem(HANDS_FREE_KEY, next ? '1' : '0')
-    } catch {
-      /* preference is optional */
-    }
-    if (next) {
-      if (voice.status !== 'listening') void voice.start()
-    } else {
-      voice.setOnUtterance(null)
-      voice.stop()
-    }
-  }
+  const toggleHandsFree = () => onHandsFreeChange(!handsFree)
 
   const stopStream = () => {
+    speechSequenceRef.current += 1
+    turnSequenceRef.current += 1
+    turnSpeechRef.current = null
     stopSpeaking()
     voice.markSpeaking(false)
+    voice.setReplyPhase(null)
     turnCancelledRef.current = true
     if (agentActiveRef.current && bridge) {
       void bridge.agent.stop()
@@ -714,8 +785,6 @@ export default function ChatPage({
     }
     // Also covers a turn stopped while the provider is still connecting.
     stopLLM()
-    clearHuman()
-    human.reset()
     setTyping(false)
     setStatusLine('')
     // Nothing streamed yet: drop the empty assistant slot so the transcript
@@ -737,15 +806,18 @@ export default function ChatPage({
     if (handsFree) voice.resumeListening()
   }
 
-  const speakLast = async () => {
+  const previousHandsFree = useRef(handsFree)
+  useEffect(() => {
+    if (previousHandsFree.current && !handsFree) stopStream()
+    previousHandsFree.current = handsFree
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handsFree])
+
+  const speakLast = () => {
     const last = [...messagesRef.current].reverse().find((m) => m.role === 'assistant')
     if (!last) return
-    voice.markSpeaking(true)
-    const res = await speak(last.text, voiceCfg).finally(() => voice.markSpeaking(false))
-    if (!res.ok) {
-      logFailure('Chat · speak', res.detail)
-      pushNotification({ title: 'Speech failed', body: res.detail, kind: 'voice' })
-    }
+    if (handsFree) voice.pauseListening()
+    speakReply(last.text, handsFree ? () => voice.resumeListening() : undefined)
   }
 
   const toggleSpeak = () => {
@@ -892,7 +964,7 @@ export default function ChatPage({
             <div className="chat-row assistant">
               <span className="chat-avatar"><Bot size={14} /></span>
               <div className="chat-bubble typing">
-                <span className="thinking-label">{statusLine || (thinking ? 'Thinking…' : 'Receiving…')}</span>
+                <span className="thinking-label">{statusLine || 'Waiting for the model…'}</span>
                 {agentMode && agentSteps.length > 0 && (
                   <span className="chat-agent-steps">
                     {agentSteps.slice(-8).map((s) => (
@@ -1022,7 +1094,7 @@ export default function ChatPage({
           <button
             type="button"
             className="icon-btn !w-[34px] !h-[34px] !border-0 !bg-transparent"
-            onClick={onToggleListening}
+            onClick={() => onHandsFreeChange(voice.status !== 'listening' && voice.status !== 'starting')}
             aria-label={voice.status === 'listening' ? 'Stop voice input' : 'Voice input'}
             title={voice.status === 'listening' ? 'Stop voice input' : 'Voice input'}
           >

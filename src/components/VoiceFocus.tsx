@@ -93,7 +93,11 @@ export default function VoiceFocus({ voice }: { voice: Voice }) {
 
   if (!active) return null
 
-  const status = voice.speaking ? 'ORVEX is speaking' : voice.partial ? 'Transcribing…' : 'Listening'
+  const status = voice.error ? 'Voice needs attention'
+    : voice.speaking ? 'ORVEX is speaking'
+      : voice.replyPhase === 'preparing' ? 'Preparing voice…'
+        : voice.replyPhase === 'thinking' ? 'Waiting for the model…'
+          : voice.transcribing || voice.partial ? 'Transcribing…' : 'Listening'
   const detail = voice.error
     ? voice.error
     : voice.interim

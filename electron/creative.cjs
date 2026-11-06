@@ -279,6 +279,7 @@ function uniqueName(dir, desired) {
 
 async function saveBuffer(buffer, opts = {}) {
   requireReady();
+  opts.signal?.throwIfAborted();
   if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('The provider returned an empty file.');
   const baseName = String(opts.name || '').trim();
   let ext = (opts.ext || extOf(baseName) || '').replace(/^\./, '').toLowerCase();
@@ -286,30 +287,52 @@ async function saveBuffer(buffer, opts = {}) {
   const display = baseName
     ? baseName.toLowerCase().endsWith(`.${ext}`) ? baseName : `${baseName}.${ext}`
     : `${opts.kind || 'asset'}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`;
-  const record = await mutateIndex(async (lib) => {
-    const id = newId('med');
-    const file = `${id}.${ext}`;
-    await fsp.writeFile(path.join(filesDir(), file), buffer);
-    const kind = opts.kind || kindOfExt(ext);
-    const meta = opts.meta || (await deriveMeta(path.join(filesDir(), file), kind));
-    const row = {
-      id,
-      name: display,
-      kind,
-      file,
-      ext,
-      mime: opts.mime || mimeOf(file),
-      bytes: buffer.length,
-      createdAt: now(),
-      source: opts.source || 'generated',
-      prompt: opts.prompt ? String(opts.prompt).slice(0, MAX_PROMPT) : null,
-      provider: opts.provider || null,
-      model: opts.model || null,
-      meta: meta || null,
-    };
-    lib.assets.push(row);
-    return row;
-  });
+  let record;
+  let pendingFile;
+  let pendingId;
+  try {
+    record = await mutateIndex(async (lib) => {
+      opts.signal?.throwIfAborted();
+      const id = newId('med');
+      const file = `${id}.${ext}`;
+      pendingFile = path.join(filesDir(), file);
+      await fsp.writeFile(pendingFile, buffer, opts.signal ? { signal: opts.signal } : undefined);
+      opts.signal?.throwIfAborted();
+      const kind = opts.kind || kindOfExt(ext);
+      const meta = opts.meta || (await deriveMeta(pendingFile, kind));
+      opts.signal?.throwIfAborted();
+      const row = {
+        id,
+        name: display,
+        kind,
+        file,
+        ext,
+        mime: opts.mime || mimeOf(file),
+        bytes: buffer.length,
+        createdAt: now(),
+        source: opts.source || 'generated',
+        prompt: opts.prompt ? String(opts.prompt).slice(0, MAX_PROMPT) : null,
+        provider: opts.provider || null,
+        model: opts.model || null,
+        meta: meta || null,
+      };
+      pendingId = id;
+      lib.assets.push(row);
+      return row;
+    });
+    opts.signal?.throwIfAborted();
+  } catch (err) {
+    // Cancellable saves are unpublished until both file and index finish. An
+    // abort during either write must not leave a partial or indexed asset.
+    if (opts.signal) {
+      try {
+        if (pendingId) await mutateIndex((lib) => { lib.assets = lib.assets.filter((a) => a.id !== pendingId); });
+      } finally {
+        if (pendingFile) await fsp.rm(pendingFile, { force: true });
+      }
+    }
+    throw err;
+  }
   emit({ type: 'add', asset: publicAsset(record) });
   return publicAsset(record);
 }
@@ -1120,8 +1143,7 @@ async function heygenVoices({ key, type = 'public' } = {}) {
   return { voices, type: scope, pages, complete };
 }
 
-async function heygenSpeak({ key, text, voiceId, model, language, speed, pitch, expressiveness, seed } = {}) {
-  requireReady();
+function heygenSpeechRequest({ key, text, voiceId, model, language, speed, pitch, expressiveness, seed }) {
   const apiKey = String(key || '').trim();
   if (!apiKey) throw new Error('Add your HeyGen API key in Settings → Voice first.');
   const clean = String(text || '').replace(/\s+/g, ' ').trim();
@@ -1143,7 +1165,12 @@ async function heygenSpeak({ key, text, voiceId, model, language, speed, pitch, 
   if (Number.isFinite(boost) && boost !== 0) body.expressiveness_boost = Math.min(1.5, Math.max(0.5, boost));
   const s = Number(seed);
   if (Number.isFinite(s) && s > 0) body.seed = Math.floor(s);
+  return { apiKey, clean, voice, mdl, body };
+}
 
+async function heygenSpeak(options = {}) {
+  requireReady();
+  const { apiKey, clean, voice, mdl, body } = heygenSpeechRequest(options);
   const { json, text: raw } = await requestJson(`${HEYGEN_ORIGIN}/v3/models/audio/tts`, {
     method: 'POST',
     headers: { 'x-api-key': apiKey, 'content-type': 'application/json', accept: 'application/json' },
@@ -1168,6 +1195,258 @@ async function heygenSpeak({ key, text, voiceId, model, language, speed, pitch, 
     prompt: clean,
   });
   return { asset, model: mdl, voiceId: voice, duration: data && Number.isFinite(data.duration) ? data.duration : null };
+}
+
+// Bound both the SSE envelope and each decoded standalone WAV. The aggregate
+// wire budget also bounds retained PCM; many tiny parts need a separate cap.
+const HEYGEN_STREAM_TIMEOUT_MS = 120000;
+const HEYGEN_STREAM_PART_BYTES = 8 * 1024 * 1024;
+const HEYGEN_STREAM_EVENT_CHARS = 12 * 1024 * 1024;
+const HEYGEN_STREAM_MAX_PARTS = 4096;
+
+function heygenWavPart(audio) {
+  if (typeof audio !== 'string' || !audio.length || audio.length > Math.ceil(HEYGEN_STREAM_PART_BYTES / 3) * 4 ||
+      audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(audio)) {
+    throw new Error('HeyGen returned invalid or oversized base64 audio.');
+  }
+  const wav = Buffer.from(audio, 'base64');
+  if (!wav.length || wav.length > HEYGEN_STREAM_PART_BYTES || wav.toString('base64') !== audio) {
+    throw new Error('HeyGen returned invalid or oversized base64 audio.');
+  }
+  const invalid = () => new Error('HeyGen returned a malformed or unsupported PCM WAV part.');
+  if (wav.length < 44 || wav.toString('latin1', 0, 4) !== 'RIFF' || wav.toString('latin1', 8, 12) !== 'WAVE' ||
+      wav.readUInt32LE(4) + 8 !== wav.length) throw invalid();
+  let fmt = null;
+  let data = null;
+  for (let offset = 12; offset < wav.length;) {
+    if (offset + 8 > wav.length) throw invalid();
+    const id = wav.toString('latin1', offset, offset + 4);
+    const size = wav.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    const end = start + size;
+    const next = end + (size & 1);
+    if (next > wav.length) throw invalid();
+    if (id === 'fmt ') {
+      if (fmt) throw invalid();
+      fmt = wav.subarray(start, end);
+    } else if (id === 'data') {
+      if (data) throw invalid();
+      data = wav.subarray(start, end);
+    }
+    offset = next;
+  }
+  if (!fmt || fmt.length < 16 || !data || !data.length) throw invalid();
+  const tag = fmt.readUInt16LE(0);
+  // PCM, including WAVE_FORMAT_EXTENSIBLE with the PCM subformat GUID.
+  if (tag === 1) {
+    if (fmt.length !== 16 && !(fmt.length === 18 && fmt.readUInt16LE(16) === 0)) throw invalid();
+  } else if (tag === 0xfffe) {
+    if (fmt.length !== 40 || fmt.readUInt16LE(16) !== 22 ||
+        fmt.subarray(24).toString('hex') !== '0100000000001000800000aa00389b71' ||
+        !fmt.readUInt16LE(18) || fmt.readUInt16LE(18) > fmt.readUInt16LE(14)) throw invalid();
+  } else {
+    throw invalid();
+  }
+  const channels = fmt.readUInt16LE(2);
+  const sampleRate = fmt.readUInt32LE(4);
+  const byteRate = fmt.readUInt32LE(8);
+  const blockAlign = fmt.readUInt16LE(12);
+  const bits = fmt.readUInt16LE(14);
+  if (!channels || !sampleRate || ![8, 16, 24, 32].includes(bits) ||
+      blockAlign !== channels * bits / 8 || byteRate !== sampleRate * blockAlign || data.length % blockAlign) throw invalid();
+  return { fmt, data, byteRate };
+}
+
+function heygenMergeWav(fmt, parts, bytes) {
+  const wav = Buffer.alloc(28 + fmt.length + bytes + (bytes & 1));
+  wav.write('RIFF', 0);
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(fmt.length, 16);
+  fmt.copy(wav, 20);
+  const dataHeader = 20 + fmt.length;
+  wav.write('data', dataHeader);
+  wav.writeUInt32LE(bytes, dataHeader + 4);
+  let offset = dataHeader + 8;
+  for (const part of parts) {
+    part.copy(wav, offset);
+    offset += part.length;
+  }
+  return wav;
+}
+
+async function heygenSpeakStream({ key, text, voiceId, model, language, speed, pitch, expressiveness, seed, signal, onAudio } = {}) {
+  requireReady();
+  const { apiKey, clean, voice, mdl, body } = heygenSpeechRequest({ key, text, voiceId, model, language, speed, pitch, expressiveness, seed });
+  if (onAudio !== undefined && typeof onAudio !== 'function') throw new Error('HeyGen onAudio must be a function.');
+  const controller = new AbortController();
+  const cancel = () => controller.abort(Object.assign(new Error('The HeyGen speech stream was cancelled.'), { name: 'AbortError' }));
+  let reader;
+  const cancelReader = () => {
+    if (reader) void reader.cancel().catch(() => {});
+  };
+  controller.signal.addEventListener('abort', cancelReader, { once: true });
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const deadline = Date.now() + HEYGEN_STREAM_TIMEOUT_MS;
+  const timeout = () => controller.abort(Object.assign(
+    new Error('The HeyGen speech stream timed out after 120s.'), { name: 'TimeoutError' },
+  ));
+  const timer = setTimeout(timeout, HEYGEN_STREAM_TIMEOUT_MS);
+  const checkActive = () => {
+    // Already-buffered reads can keep resolving in microtasks before a timer
+    // runs, so enforce the same wall-clock deadline at parsing boundaries too.
+    if (!controller.signal.aborted && Date.now() >= deadline) timeout();
+    controller.signal.throwIfAborted();
+  };
+  const wait = async (promise) => {
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(controller.signal.reason);
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+      if (controller.signal.aborted) onAbort();
+    });
+    try {
+      const result = await Promise.race([promise, aborted]);
+      // Cancelling a reader can resolve read() with EOF before the abort
+      // rejection wins the race. Cancellation still takes precedence.
+      checkActive();
+      return result;
+    } catch (err) {
+      controller.signal.throwIfAborted();
+      throw err;
+    } finally {
+      // Do not accumulate pending Promise.race handlers over fragmented reads.
+      controller.signal.removeEventListener('abort', onAbort);
+    }
+  };
+  const parts = [];
+  let format;
+  let pcmBytes = 0;
+  try {
+    checkActive();
+    const res = await wait(fetch(`${HEYGEN_ORIGIN}/v3/models/audio/tts/stream`, {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify(body), // output_format is not supported by the SSE endpoint.
+      signal: controller.signal,
+    }));
+    reader = res.body?.getReader();
+    if (!res.ok) throw new Error(`HeyGen speech stream returned HTTP ${res.status}.`);
+    if (!reader) throw new Error('HeyGen returned an empty speech stream.');
+    if ((res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'text/event-stream') {
+      throw new Error('HeyGen did not return a speech event stream.');
+    }
+    const declaredBytes = Number(res.headers.get('content-length'));
+    if (declaredBytes > MAX_DOWNLOAD) throw new Error('HeyGen speech stream exceeded 100 MB.');
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let received = 0;
+    let done = false;
+    let skipLF = false;
+    let lineParts = [];
+    let lineChars = 0;
+    let eventChars = 0;
+    let dataLines = [];
+    const append = (fragment) => {
+      lineChars += fragment.length;
+      if (eventChars + lineChars > HEYGEN_STREAM_EVENT_CHARS) throw new Error('HeyGen speech event is too large.');
+      if (fragment) lineParts.push(fragment);
+    };
+    const dispatch = async () => {
+      checkActive();
+      if (!dataLines.length) return;
+      const payload = dataLines.join('\n');
+      dataLines = [];
+      if (payload === '[DONE]') {
+        done = true;
+        return;
+      }
+      let event;
+      try { event = JSON.parse(payload); } catch { throw new Error('HeyGen returned malformed speech event JSON.'); }
+      if (event?.type === 'error') throw new Error(`HeyGen speech error — ${String(event.detail || 'unknown provider error').slice(0, 500)}`);
+      if (event?.type === 'character_alignment') return;
+      if (event?.type !== 'audio') throw new Error('HeyGen returned an unknown speech event.');
+      if (!Number.isSafeInteger(event.part_index) || event.part_index !== parts.length || parts.length >= HEYGEN_STREAM_MAX_PARTS) {
+        throw new Error('HeyGen returned an out-of-order or excessive audio part_index.');
+      }
+      const part = heygenWavPart(event.audio);
+      if (format && !format.fmt.equals(part.fmt)) throw new Error('HeyGen returned mismatched WAV formats.');
+      format ||= part;
+      pcmBytes += part.data.length;
+      if (pcmBytes > MAX_DOWNLOAD) throw new Error('HeyGen speech audio exceeded 100 MB.');
+      parts.push(part.data);
+      // Deliver a validated standalone WAV, not an incomplete combined file.
+      if (onAudio) await wait(onAudio({ index: event.part_index, audio: event.audio }));
+      checkActive();
+    };
+    const finishLine = async () => {
+      const line = lineParts.join('');
+      lineParts = [];
+      lineChars = 0;
+      eventChars += line.length + 1;
+      if (eventChars > HEYGEN_STREAM_EVENT_CHARS) throw new Error('HeyGen speech event is too large.');
+      if (!line) {
+        eventChars = 0;
+        await dispatch();
+      } else if (line === 'data' || line.startsWith('data:')) {
+        const value = line === 'data' ? '' : line.slice(5);
+        dataLines.push(value.startsWith(' ') ? value.slice(1) : value);
+      }
+    };
+    const feed = async (chunk) => {
+      if (!chunk) return;
+      let offset = skipLF && chunk[0] === '\n' ? 1 : 0;
+      skipLF = false;
+      const newline = /\r\n|\r|\n/g;
+      newline.lastIndex = offset;
+      let match;
+      while (!done && (match = newline.exec(chunk))) {
+        append(chunk.slice(offset, match.index));
+        offset = newline.lastIndex;
+        skipLF = match[0] === '\r' && offset === chunk.length;
+        await finishLine();
+      }
+      if (!done) append(chunk.slice(offset));
+    };
+    while (!done) {
+      checkActive();
+      const chunk = await wait(reader.read());
+      if (chunk.done) {
+        await feed(decoder.decode());
+        if (!done) throw new Error('HeyGen speech stream ended before [DONE].');
+        break;
+      }
+      received += chunk.value.byteLength;
+      if (received > MAX_DOWNLOAD) throw new Error('HeyGen speech stream exceeded 100 MB.');
+      await feed(decoder.decode(chunk.value, { stream: true }));
+    }
+    checkActive();
+    if (!parts.length) throw new Error('HeyGen returned no audio parts.');
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
+    controller.signal.removeEventListener('abort', cancelReader);
+    // [DONE] is the protocol terminator; do not wait for transport EOF.
+    cancelReader();
+    controller.abort();
+    try { reader?.releaseLock(); } catch { /* a cancelled read may still be settling */ }
+  }
+  // Saving is only reached after a clean protocol completion, never on a
+  // provider/parser/callback failure or an aborted/incomplete stream.
+  signal?.throwIfAborted();
+  const buffer = heygenMergeWav(format.fmt, parts, pcmBytes);
+  const asset = await saveBuffer(buffer, {
+    name: `heygen-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`,
+    ext: 'wav',
+    kind: 'audio',
+    mime: MIME.wav,
+    source: 'tts',
+    provider: 'heygen',
+    model: mdl,
+    prompt: clean,
+    signal: signal || new AbortController().signal,
+  });
+  return { asset, model: mdl, voiceId: voice, duration: pcmBytes / format.byteRate };
 }
 
 async function music({ url, key, body, ext, name } = {}) {
@@ -1557,6 +1836,7 @@ module.exports = {
   synthesize,
   heygenVoices,
   heygenSpeak,
+  heygenSpeakStream,
   music,
   modelMeta,
   inspect3D,

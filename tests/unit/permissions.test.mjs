@@ -14,7 +14,14 @@ afterAll(() => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const storedFloors = () => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'permissions.json'), 'utf8'))
+    return Array.isArray(raw.floors) ? raw.floors : []
+  } catch {
+    return []
+  }
+}
 
 describe('approval floors', () => {
   it('starts with no floors', () => {
@@ -56,7 +63,8 @@ describe('approval floors', () => {
   })
 
   it('persists floors to disk', async () => {
-    await sleep(250)
+    // The store is debounced, so wait for the file to appear instead of a fixed sleep.
+    await expect.poll(() => storedFloors().length, { timeout: 10000 }).toBe(1)
     permissions.init({ dataDir: dir, registry: () => [] })
     const floors = permissions.state().floors
     expect(floors.length).toBe(1)

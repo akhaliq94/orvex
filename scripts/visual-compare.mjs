@@ -117,7 +117,7 @@ async function main() {
 
   mkdirSync(BASELINE_DIR, { recursive: true })
   const profile = mkdtempSync(path.join(tmpdir(), 'orvex-visual-'))
-  const env = { ...process.env, ORVEX_USER_DATA_DIR: profile }
+  const env = { ...process.env, ORVEX_USER_DATA_DIR: profile, ORVEX_DISABLE_LOCAL_WHISPER: '1' }
   delete env.VITE_DEV_URL
 
   const launchOptions =

@@ -21,7 +21,7 @@ import type { OrvexSecurityStatus } from './types/desktop'
 import { readVoiceConfig } from './data/stt'
 import { ProvidersProvider } from './hooks/useProviders'
 import { BackgroundProvider, useBackground } from './hooks/useBackground'
-import { VoiceSettingsProvider } from './data/voice'
+import { stopSpeaking, VoiceSettingsProvider } from './data/voice'
 import {
   clearNotifications,
   clearRead,
@@ -45,6 +45,13 @@ export default function App() {
   const [chatConvId, setChatConvId] = useState<string | null>(null)
   const [chatAgentId, setChatAgentId] = useState<string | null>(null)
   const [chatDraft, setChatDraft] = useState<string | null>(null)
+  const [handsFree, setHandsFree] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('orvex-handsfree') === '1'
+    } catch {
+      return false
+    }
+  })
   const [notifOpen, setNotifOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
 
@@ -57,12 +64,20 @@ export default function App() {
 
   const notify = useCallback((msg: string) => setToast(msg), [])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('orvex-handsfree', handsFree ? '1' : '0')
+    } catch {
+      // Keep the session usable when local storage is unavailable.
+    }
+  }, [handsFree])
+
   // A locked app should not keep the microphone open.
   const stopVoiceRef = useRef(voice.stop)
   stopVoiceRef.current = voice.stop
   useEffect(() => {
-    if (locked) stopVoiceRef.current()
-  }, [locked])
+    if (locked || security.status?.emergency.stopped) stopVoiceRef.current()
+  }, [locked, security.status?.emergency.stopped])
 
   const clearEmergency = async () => {
     const bridge = typeof window !== 'undefined' ? window.orvex : undefined
@@ -123,13 +138,22 @@ export default function App() {
     notify(auto ? 'Manual theme selection' : 'Following system appearance')
   }
 
-  const toggleListening = () => {
-    if (listening) {
-      voice.stop()
+  const onHandsFreeChange = (enabled: boolean) => {
+    setHandsFree(enabled)
+    if (enabled) {
+      setChatPrompt(null)
+      setChatAgentId(null)
+      setChatDraft(null)
+      setPageTab(null)
+      setActiveNav('chat')
+      if (activeNav === 'chat') void voice.start()
     } else {
-      void voice.start()
+      voice.stop()
+      stopSpeaking()
     }
   }
+
+  const toggleListening = () => onHandsFreeChange(!listening)
 
   const handleCommand = (text: string) => {
     setChatPrompt(text)
@@ -306,6 +330,8 @@ export default function App() {
             searchOpen={searchOpen}
             voice={voice}
             listening={listening}
+            handsFree={handsFree}
+            onHandsFreeChange={onHandsFreeChange}
             theme={theme}
             security={security.status}
             onSecurityStatus={security.setStatus}
@@ -345,6 +371,8 @@ function AppShell(p: {
   searchOpen: boolean
   voice: ReturnType<typeof useVoice>
   listening: boolean
+  handsFree: boolean
+  onHandsFreeChange: (enabled: boolean) => void
   theme: Theme
   security: OrvexSecurityStatus | null
   onSecurityStatus: (s: OrvexSecurityStatus) => void
@@ -451,6 +479,8 @@ function AppShell(p: {
             onNavigate: p.handleNavigate,
             voice: p.voice,
             onToggleListening: p.toggleListening,
+            handsFree: p.handsFree,
+            onHandsFreeChange: p.onHandsFreeChange,
             chatPrompt: p.chatPrompt,
             chatConvId: p.chatConvId,
             chatAgentId: p.chatAgentId,

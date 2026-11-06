@@ -661,7 +661,7 @@ function channelBlocked(channel) {
   const name = String(channel || '');
   if (!locked) {
     const work =
-      /^orvex:(tool|agent:(start|resume|approve)|orchestrator:(start|resume)|workflows:(run|approve|resume)|llm:start|research:start|code:(run|terminal)|collab:start|stt:transcribe|memory:ask|vision:(analyze|capture|ocr)|monitor:(compare|health|evalRun)|advanced:(jobStart|jobResume|recoveryResume|rulesTick|eval|suggest|learningMine)|media:(generate|edit|removeBackground|upscale|subtitles|transcribe|tts|music|analyze)|integrations:(run|webhook|http|ws)|gamepilot:start)$/;
+      /^orvex:(tool|agent:(start|resume|approve)|orchestrator:(start|resume)|workflows:(run|approve|resume)|llm:start|research:start|code:(run|terminal)|collab:start|stt:transcribe|memory:ask|vision:(analyze|capture|ocr)|monitor:(compare|health|evalRun)|advanced:(jobStart|jobResume|recoveryResume|rulesTick|eval|suggest|learningMine)|media:(generate|edit|removeBackground|upscale|subtitles|transcribe|tts|heygenTts|heygenTtsStream|music|analyze)|integrations:(run|webhook|http|ws)|gamepilot:start)$/;
     if (state.emergency.stopped && work.test(name)) {
       return `Emergency stop is active${state.emergency.reason ? ` (${state.emergency.reason})` : ''}. Clear it on Security → Overview.`;
     }

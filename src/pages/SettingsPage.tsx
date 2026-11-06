@@ -34,7 +34,21 @@ import { useProviders } from '../hooks/useProviders'
 import { PROVIDER_PRESETS, fetchRemoteModels, freeIdsFromCatalog, testProvider, type ProviderConfig, type RemoteModelList } from '../data/providers'
 import { VOICE_ENGINES, VOICE_PRESETS, useVoiceSettings, type VoiceEngineId, speak } from '../data/voice'
 import { discoverSpeech } from '../data/voicestudio'
-import { hasSttKey, saveSttKey, sttTarget } from '../data/stt'
+import {
+  addSttKey,
+  ASR_PRESETS,
+  asrPresetFor,
+  asrPresetPatch,
+  fetchSttModels,
+  hasSttKey,
+  listSttKeys,
+  removeSttKey,
+  resetSttKeys,
+  saveSttKey,
+  sttTarget,
+  type AsrPresetId,
+  type SttKeyList,
+} from '../data/stt'
 import { HEYGEN_MODELS, fetchHeygenVoices, hasHeygenKey, saveHeygenKey, type HeygenVoice } from '../data/heygen'
 import type { Theme } from '../themes'
 import type {
@@ -1613,23 +1627,43 @@ function McpTab({ notify }: { notify: (m: string) => void }) {
 
 function VoiceTab({ notify }: { notify: (m: string) => void }) {
   const { cfg, setCfg } = useVoiceSettings()
+  const bridge = typeof window !== 'undefined' ? window.orvex : undefined
   const fileRef = useRef<HTMLInputElement>(null)
   const [testing, setTesting] = useState<'tts' | 'asr' | null>(null)
   const [probe, setProbe] = useState<string | null>(null)
   const [sttKey, setSttKey] = useState('')
   const [sttSaved, setSttSaved] = useState(false)
   const [sttMsg, setSttMsg] = useState('')
+  const [linkBusy, setLinkBusy] = useState(false)
   const [heygenKey, setHeygenKey] = useState('')
   const [heygenSaved, setHeygenSaved] = useState(false)
   const [heygenMsg, setHeygenMsg] = useState('')
   const [heygenVoices, setHeygenVoices] = useState<HeygenVoice[]>([])
   const [heygenFilter, setHeygenFilter] = useState('')
   const [voicesBusy, setVoicesBusy] = useState(false)
+  const [pool, setPool] = useState<SttKeyList | null>(null)
+  const [poolKey, setPoolKey] = useState('')
+  const [poolLabel, setPoolLabel] = useState('')
+  const [poolBusy, setPoolBusy] = useState(false)
+  const [asrModels, setAsrModels] = useState<string[]>([])
+  const [asrModelMsg, setAsrModelMsg] = useState('')
 
   useEffect(() => {
     void hasSttKey().then(setSttSaved)
     void hasHeygenKey().then(setHeygenSaved)
   }, [])
+
+  const asrEndpoint = sttTarget(cfg)?.url || ''
+
+  useEffect(() => {
+    let live = true
+    void listSttKeys(asrEndpoint).then((rows) => {
+      if (live) setPool(rows)
+    })
+    return () => {
+      live = false
+    }
+  }, [asrEndpoint])
 
   const saveHeygen = async () => {
     const res = await saveHeygenKey(heygenKey)
@@ -1688,6 +1722,90 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
       setSttKey('')
     }
     notify(res.detail)
+  }
+
+  /**
+   * A saved key belongs to the endpoint it was pasted for, so switching source
+   * means the old one no longer unlocks transcription.
+   */
+  const pickPreset = (id: AsrPresetId) => {
+    if (id === asrPresetFor(cfg)) return
+    setCfg(asrPresetPatch(id))
+    if (id !== 'custom' && sttSaved) {
+      setSttMsg('Endpoint changed — the saved key belongs to the previous one. Save it again or use your provider key.')
+    }
+  }
+
+  /** Reuses a chat provider's stored key for transcription; the value never reaches this window. */
+  const linkProviderKey = async () => {
+    const endpoint = sttTarget(cfg)?.url || ''
+    if (!endpoint) {
+      setSttMsg('Pick a speech input endpoint first.')
+      return
+    }
+    if (!bridge) return
+    setLinkBusy(true)
+    try {
+      const res = await bridge.stt.useProviderKey(endpoint)
+      if (!res.ok) {
+        setSttMsg(res.error)
+        notify(res.error)
+        return
+      }
+      setSttSaved(true)
+      setSttKey('')
+      setSttMsg(`Transcription now uses the key already saved for ${res.data.provider}.`)
+      notify('Speech input linked to your provider key.')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setSttMsg(msg)
+      notify(msg)
+    } finally {
+      setLinkBusy(false)
+    }
+  }
+
+  const addPoolKey = async () => {
+    if (!poolKey.trim()) return
+    setPoolBusy(true)
+    const res = await addSttKey(poolKey, poolLabel, asrEndpoint)
+    setPoolBusy(false)
+    setSttMsg(res.detail)
+    if (res.ok) {
+      setPoolKey('')
+      setPoolLabel('')
+      setPool(await listSttKeys(asrEndpoint))
+      void hasSttKey().then(setSttSaved)
+    }
+    notify(res.detail)
+  }
+
+  const dropPoolKey = async (id: string) => {
+    setPoolBusy(true)
+    const res = await removeSttKey(id, asrEndpoint)
+    setPool(await listSttKeys(asrEndpoint))
+    setPoolBusy(false)
+    notify(res.detail)
+  }
+
+  const clearPoolStatus = async () => {
+    setPoolBusy(true)
+    const res = await resetSttKeys()
+    setPool(await listSttKeys(asrEndpoint))
+    setPoolBusy(false)
+    notify(res.detail)
+  }
+
+  const pullAsrModels = async () => {
+    if (!asrEndpoint) {
+      setAsrModelMsg('Pick a speech input endpoint first.')
+      return
+    }
+    setPoolBusy(true)
+    const res = await fetchSttModels(asrEndpoint)
+    setPoolBusy(false)
+    setAsrModelMsg(res.detail)
+    if (res.ok) setAsrModels(res.models)
   }
 
   const testSpeak = async () => {
@@ -1974,10 +2092,26 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
           <h3 className="settings-h">Speech to text</h3>
         </div>
         <p className="settings-note">
-          The desktop app has no built-in speech service, so voice input records each turn locally and sends it to an
-          OpenAI-compatible transcription endpoint (<code>POST …/audio/transcriptions</code>, multipart). Any provider that
-          offers Whisper works — for example Groq or OpenAI. Without an endpoint, voice input stays off and you type.
+          Voice input records each turn and sends it to an OpenAI-compatible transcription endpoint
+          (<code>POST …/audio/transcriptions</code>, multipart). Local Whisper costs nothing but it transcribes on this
+          machine's own cores, which is slow when the model is also local — a hosted endpoint answers a turn in about a
+          second instead.
         </p>
+        <div className="field-row">
+          <label className="field-label" htmlFor="asr-preset">Speech input source</label>
+          <select
+            id="asr-preset"
+            className="text-input"
+            value={asrPresetFor(cfg)}
+            onChange={(e) => pickPreset(e.target.value as AsrPresetId)}
+          >
+            {ASR_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="field-row">
           <label className="field-label" htmlFor="asr-url">STT endpoint URL</label>
           <input
@@ -1990,14 +2124,26 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
         </div>
         <div className="field-row">
           <label className="field-label" htmlFor="asr-model">STT model</label>
-          <input
-            id="asr-model"
-            className="text-input"
-            value={cfg.asrModel}
-            onChange={(e) => setCfg({ asrModel: e.target.value })}
-            placeholder="whisper-1 / whisper-large-v3"
-          />
+          <div className="field-inline">
+            <input
+              id="asr-model"
+              className="text-input"
+              list="asr-model-list"
+              value={cfg.asrModel}
+              onChange={(e) => setCfg({ asrModel: e.target.value })}
+              placeholder="whisper-1 / whisper-large-v3 / scribe_v2"
+            />
+            <button className="ghost-btn" onClick={() => void pullAsrModels()} disabled={poolBusy}>
+              {poolBusy ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />} Fetch models
+            </button>
+            <datalist id="asr-model-list">
+              {asrModels.map((m) => (
+                <option key={m} value={m} />
+              ))}
+            </datalist>
+          </div>
         </div>
+        {asrModelMsg && <div className="settings-note">{asrModelMsg}</div>}
         <div className="field-row">
           <label className="field-label" htmlFor="asr-key">STT API key</label>
           <div className="field-inline">
@@ -2012,9 +2158,89 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
             <button className="ghost-btn" onClick={() => void saveKey()}>
               Save key
             </button>
+            <button className="ghost-btn" onClick={() => void linkProviderKey()} disabled={linkBusy}>
+              {linkBusy ? <Loader2 size={11} className="spin" /> : <KeyRound size={11} />} Use my provider key
+            </button>
           </div>
         </div>
+        <p className="settings-note">
+          The key is stored in the OS-encrypted vault and is only ever sent to this exact endpoint. "Use my provider key"
+          copies a key already saved for the provider behind this endpoint, in the main process, so you do not paste it
+          twice.
+        </p>
         {sttMsg && <div className="settings-note">{sttMsg}</div>}
+
+        <div className="field-row">
+          <label className="field-label" htmlFor="pool-key">Backup keys</label>
+          <div className="field-inline">
+            <input
+              id="pool-key"
+              type="password"
+              className="text-input"
+              value={poolKey}
+              onChange={(e) => setPoolKey(e.target.value)}
+              placeholder={`next key for this endpoint (${pool?.keys.length ?? 0}/${pool?.limit ?? 20} saved)`}
+              autoComplete="off"
+            />
+            <input
+              id="pool-label"
+              className="text-input"
+              style={{ flex: '0 0 130px', width: 130 }}
+              value={poolLabel}
+              onChange={(e) => setPoolLabel(e.target.value)}
+              placeholder="note (optional)"
+              autoComplete="off"
+            />
+            <button className="ghost-btn" onClick={() => void addPoolKey()} disabled={poolBusy || !poolKey.trim()}>
+              {poolBusy ? <Loader2 size={11} className="spin" /> : <Plus size={11} />} Add key
+            </button>
+            {!!pool?.keys.length && (
+              <button className="ghost-btn" onClick={() => void clearPoolStatus()} disabled={poolBusy}>
+                <RefreshCcw size={11} /> Reset statuses
+              </button>
+            )}
+          </div>
+        </div>
+        <p className="settings-note">
+          When a key is refused ORVEX retries the same clip with the next one and keeps the model you chose, so a quota
+          does not end the conversation. A key out of quota waits 15 minutes, a key the endpoint rejects waits 6 hours,
+          and "Reset statuses" puts every key back in line without showing you the values. Keys are kept per endpoint, so
+          switching speech input does not throw away the list you built for another one.
+        </p>
+        {!!pool?.others && (
+          <div className="settings-note">
+            <KeyRound size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+            {pool.others} backup key{pool.others === 1 ? '' : 's'} kept for another endpoint — pick that source again and
+            they are used there.
+          </div>
+        )}
+        {!!pool?.keys.length && (
+          <div className="stt-keys">
+            {pool.keys.map((k) => (
+              <div className="stt-key-row" key={k.id}>
+                <KeyRound size={10} style={{ color: 'var(--faint)', flex: '0 0 auto' }} />
+                <span className="sk-label">{k.label || 'unlabelled key'}</span>
+                <span
+                  className={`sk-state${k.state === 'working' ? '' : k.state === 'cooling' ? ' warn' : k.state === 'quota' ? ' warn' : ' bad'}`}
+                  title={k.detail || undefined}
+                >
+                  {k.stateLabel}
+                  {k.fails > 1 ? ` ×${k.fails}` : ''}
+                  {k.retryInMs > 0 ? ` · retry in ${Math.ceil(k.retryInMs / 60000)} min` : ''}
+                </span>
+                <button
+                  className="key-eye"
+                  onClick={() => void dropPoolKey(k.id)}
+                  disabled={poolBusy}
+                  title="Remove this key"
+                  aria-label={`Remove backup transcription key ${k.label || k.id}`}
+                >
+                  <Trash2 size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="field-row">
           <label className="field-label" htmlFor="asr-path">ASR path (local server)</label>
           <input

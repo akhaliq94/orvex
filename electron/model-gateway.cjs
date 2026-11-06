@@ -32,12 +32,20 @@ const Ajv = AjvMod.Ajv || AjvMod.default || AjvMod;
 const ajv = new Ajv({ allErrors: true, strict: false });
 
 class ModelError extends Error {
-  constructor(message, { status = 0, retryable = false, detail = '' } = {}) {
+  // The 400-shaped hints below are what let chat() retry a provider that
+  // refuses stream_options or max_completion_tokens instead of failing the run.
+  constructor(
+    message,
+    { status = 0, retryable = false, detail = '', retryAfter = 0, streamOptions = false, maxTokens = false } = {},
+  ) {
     super(message);
     this.name = 'ModelError';
     this.status = status;
     this.retryable = retryable;
     this.detail = detail;
+    this.retryAfter = retryAfter;
+    this.streamOptions = streamOptions;
+    this.maxTokens = maxTokens;
   }
 }
 

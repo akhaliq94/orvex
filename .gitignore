@@ -18,3 +18,6 @@ secrets.json
 /keys/
 *.pem
 *.key
+
+# binaries ORVEX downloads at runtime (whisper.cpp, ffmpeg) — never committed
+tools/

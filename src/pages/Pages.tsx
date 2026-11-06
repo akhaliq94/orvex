@@ -35,6 +35,8 @@ type Deps = {
   onNavigate: (id: string, label?: string, tab?: string) => void
   voice: Voice
   onToggleListening: () => void
+  handsFree: boolean
+  onHandsFreeChange: (enabled: boolean) => void
   chatPrompt: string | null
   chatConvId: string | null
   chatAgentId: string | null
@@ -92,6 +94,8 @@ export default function Pages({ view, deps }: { view: PageId; deps: Deps }) {
     onNavigate,
     voice,
     onToggleListening,
+    handsFree,
+    onHandsFreeChange,
     chatPrompt,
     chatConvId,
     chatAgentId,
@@ -114,7 +118,8 @@ export default function Pages({ view, deps }: { view: PageId; deps: Deps }) {
           initialAgentId={chatAgentId}
           initialDraft={chatDraft}
           voice={voice}
-          onToggleListening={onToggleListening}
+          handsFree={handsFree}
+          onHandsFreeChange={onHandsFreeChange}
         />
       )
     case 'voice':

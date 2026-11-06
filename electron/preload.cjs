@@ -73,6 +73,15 @@ contextBridge.exposeInMainWorld('orvex', {
   },
   stt: {
     transcribe: (payload) => invoke('orvex:stt:transcribe', payload),
+    setEndpoint: (url) => invoke('orvex:stt:setEndpoint', { url }),
+    useProviderKey: (url) => invoke('orvex:stt:useProviderKey', { url }),
+    models: (url) => invoke('orvex:stt:models', { url }),
+    keys: {
+      list: (url) => invoke('orvex:stt:keys:list', { url }),
+      add: (key, label, url) => invoke('orvex:stt:keys:add', { key, label, url }),
+      remove: (id, url) => invoke('orvex:stt:keys:remove', { id, url }),
+      reset: () => invoke('orvex:stt:keys:reset', {}),
+    },
   },
   routing: {
     get: () => invoke('orvex:routing:get'),
@@ -284,6 +293,13 @@ contextBridge.exposeInMainWorld('orvex', {
     tts: (payload) => invoke('orvex:media:tts', payload),
     heygenVoices: (payload) => invoke('orvex:media:heygenVoices', payload),
     heygenTts: (payload) => invoke('orvex:media:heygenTts', payload),
+    heygenTtsStream: (payload) => invoke('orvex:media:heygenTtsStream', payload),
+    stopHeygenTts: (id) => invoke('orvex:media:stopHeygenTts', { id }),
+    onHeygenAudio: (cb) => {
+      const handler = (_event, data) => cb(data);
+      ipcRenderer.on('orvex:media:heygenAudio', handler);
+      return () => ipcRenderer.removeListener('orvex:media:heygenAudio', handler);
+    },
     music: (payload) => invoke('orvex:media:music', payload),
     inspect3d: (path) => invoke('orvex:media:inspect3d', { path }),
     saveText: (name, text, ext) => invoke('orvex:media:saveText', { name, text, ext }),

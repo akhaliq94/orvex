@@ -91,6 +91,8 @@ export type OrvexAgentEvent =
   | { type: 'paused'; runId: string }
   | { type: 'resumed'; runId: string }
   | { type: 'assistant'; runId: string; text: string }
+  /** Model text as it is written, already passed through the output tripwire. */
+  | { type: 'answer_delta'; runId: string; text: string }
   | { type: 'tool_start'; runId: string; id: string; name: string; args: Record<string, unknown> }
   | {
       type: 'approval_request'
@@ -3179,6 +3181,40 @@ export type OrvexBridge = {
       type?: string
       timeoutMs?: number
     }) => Promise<IpcResult<{ text: string }>>
+    /** Record the endpoint speech input will use, so local Whisper only runs when it is needed. */
+    setEndpoint: (url: string) => Promise<IpcResult<{ local: boolean }>>
+    /** Copy an already-saved provider key into the STT vault slot. The value never comes back. */
+    useProviderKey: (url: string) => Promise<IpcResult<{ linked: boolean; provider: string }>>
+    /** Model names this endpoint reports for transcription. */
+    models: (url: string) => Promise<IpcResult<{ models: string[]; endpoint: string; source: string }>>
+    /**
+     * Extra keys for the same endpoint. Only labels and status cross this
+     * bridge — a stored key is never sent back to the renderer.
+     */
+    keys: {
+      list: (url: string) => Promise<
+        IpcResult<{
+          limit: number
+          keys: {
+            id: string
+            label: string
+            addedAt: number
+            state: 'working' | 'quota' | 'key' | 'cooling'
+            stateLabel: string
+            fails: number
+            detail: string
+            retryInMs: number
+          }[]
+          savedFor: string
+          /** Keys kept for other endpoints, so a source switch cannot look like data loss. */
+          others: number
+          hasSingleKey: boolean
+        }>
+      >
+      add: (key: string, label: string, url: string) => Promise<IpcResult<{ added: boolean; count: number; reason?: string }>>
+      remove: (id: string, url: string) => Promise<IpcResult<{ count: number }>>
+      reset: () => Promise<IpcResult<{ cleared: boolean }>>
+    }
   }
   routing: {
     get: () => Promise<IpcResult<{ routing: Record<string, OrvexRouteRef[]>; tasks: string[] }>>
@@ -3434,6 +3470,16 @@ export type OrvexBridge = {
     heygenVoices: (payload?: { type?: 'public' | 'private' }) => Promise<
       IpcResult<{ voices: { voiceId: string; name: string; language: string; gender: string; preview: string }[]; type: string; pages?: number; complete?: boolean }>
     >
+    heygenTtsStream: (payload: {
+      id: string
+      text: string
+      voiceId: string
+      model?: string
+      language?: string
+      speed?: number
+    }) => Promise<IpcResult<{ asset: OrvexMediaAsset; model: string; voiceId: string; duration: number | null }>>
+    stopHeygenTts: (id: string) => Promise<IpcResult<{ stopped: boolean }>>
+    onHeygenAudio: (cb: (event: { id: string; index: number; audio: string }) => void) => () => void
     heygenTts: (payload: {
       text: string
       voiceId: string

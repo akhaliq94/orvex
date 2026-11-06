@@ -307,6 +307,12 @@ Status as of 2026-11-03: all five original phases are implemented in the v1.0.0 
 | --- | --- | --- | --- |
 | 24.1 (done) | The per-tick model call, not the screenshot, was the bottleneck. A vision reply is now an ordered batch of 1–6 allowed keys (`{"actions":[...]}`) with a 40–2000 ms inter-key gap, so one model call drives several inputs; the vision interval floor drops to 250 ms (macro 100 ms). A camera frame is hashed (SHA-1) per tick and, while the screen is pixel-identical, the last batch is replayed without any model call — bounded to 1,200 idle repeats and still subject to the window, stop-key, security, capture, target and minute limits. Old single-action replies still parse, and every key is still checked against the allow-list before it is pressed | `electron/game-core.cjs`, `electron/game-pilot.cjs`, `electron/main.cjs`, `src/pages/GamePilotPage.tsx`, `src/types/desktop.d.ts` | `tests/unit/game-pilot.test.mjs` (23 checks), `smoke:advanced` (vision batch run with fake desktop), e2e bridge check |
 
+## Phase 25 — Local Whisper lifecycle (25.1 done)
+
+| Step | What it does | Where | Proof |
+| --- | --- | --- | --- |
+| 25.1 (done) | Voice input can run fully offline through a whisper.cpp server. When a `whisper-server` build plus a ggml model exist under `tools/whisper` (or `ORVEX_WHISPER_DIR`), the main process starts it bound to 127.0.0.1:8079 with ffmpeg on PATH, `--convert` for webm/opus clips, `-l auto` and `-nc`, and kills it when ORVEX quits. A server that was already listening is reused and never killed by the app. No install → nothing spawns and the existing "no endpoint configured" message stays truthful | `electron/whisper-local.cjs`, `electron/main.cjs` | `tests/unit/whisper-local.test.mjs` (8 checks), packaged run: auto-spawn, webm transcript, graceful close stops the child, e2e 127/127 |
+
 ## Forward-looking work (beyond v1.0.0)
 
 These are deliberately not claimed as shipped:
@@ -317,6 +323,7 @@ These are deliberately not claimed as shipped:
 4. **Plugin network policy.** The Node permission model does not restrict network; a per-plugin network allowlist would require an additional sandbox layer.
 5. **A2A scope and exposure.** Messaging (23.1) is text-in/text-out by design: peers cannot run tools or touch this machine. There is no streaming, push notification, file part or multi-turn context memory across separate A2A tasks, and the token is the only gate when the LAN option is enabled — anyone who obtains it can spend your configured model quota.
 6. **YAML OpenAPI specs.** Connectors parse JSON specs only; a YAML spec is refused with an explicit message rather than guessed at.
+7. **Bundled speech models.** The installer does not ship whisper.cpp or a ggml model. Offline dictation (25.1) needs those placed under `tools/whisper` (or pointed at with `ORVEX_WHISPER_DIR`); without them voice input reports that no endpoint is configured.
 7. **Platform coverage.** macOS and Linux adapters ship (21.1) but are only unit-tested on this Windows machine; expect to install the CLI tools the adapter names, and verify screen OCR quality on the target distro. Packaging is still Windows-first (NSIS/portable) and OS-level secrets use Electron safeStorage wherever the platform provides a keychain.
 8. **Model evaluation at scale.** The eval CLI is honest but skips without credentials; a curated local benchmark pack would make this repeatable offline.
 9. **Hands needs a multimodal model.** The control loop is real, but it only runs when a vision-capable provider endpoint is configured; with no model it fails with an explicit message instead of guessing at clicks.
@@ -362,11 +369,11 @@ These are deliberately not claimed as shipped:
 | `smoke:window-ui` (live CDP window) | 38/38 |
 | Regression: `smoke:productivity` / `smoke:monitor` / `smoke:security` | 65/65 · 73/73 backend (CDP half needs a live window) · 54/55 (CDP half needs a live window) |
 
-## Verification ledger (2026-11-05, Phase 24 build)
+## Verification ledger (2026-11-05, Phase 25 build)
 
 | Suite | Result |
 | --- | --- |
-| `npm test` (unit + adversarial) | 493 passed / 2 skipped (43 files), including 23 Game Pilot, 9 A2A text/auth, 5 HeyGen voice-page, 11 STT target/proxy and the cross-platform adapter tests |
+| `npm test` (unit + adversarial) | 501 passed / 2 skipped (44 files), including 23 Game Pilot, 9 A2A text/auth, 5 HeyGen voice-page, 11 STT target/proxy, 8 local-whisper lifecycle and the cross-platform adapter tests |
 | `npm run test:e2e:source` | 127/127 (28 nav destinations, 38 bridge modules, 5 advanced groups) |
 | `npm run test:e2e` (packaged) | 127/127 against `release/win-unpacked/ORVEX.exe` |
 | `npm run smoke:advanced` (backend) | 141/141, including the signed catalog envelope, the A2A server, and a vision batch run that presses every key from one model reply |

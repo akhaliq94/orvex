@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { readVoiceConfig, sttTarget, transcribeClip, type SttTarget } from '../data/stt'
+import { isLocalWhisper, hasSpeech, readVoiceConfig, reportSttEndpoint, sttTarget, transcribeClip, type SttTarget } from '../data/stt'
 import { stopSpeaking } from '../data/voice'
 import { BargeInDetector } from '../voice/bargein'
 import { listMicrophones, micConstraints, watchDevices, type MicDevice } from '../voice/devices'
@@ -84,6 +84,9 @@ export type Voice = {
   speaker: VoiceSpeakerHit | null
   /** true while a partial transcript upload is in flight */
   partial: boolean
+  transcribing: boolean
+  replyPhase: 'thinking' | 'preparing' | null
+  setReplyPhase: (phase: 'thinking' | 'preparing' | null) => void
   setWakeHandler: (fn: ((command: string) => void) | null) => void
   /** Chat/Engine call this around playback so barge-in can interrupt it */
   markSpeaking: (on: boolean) => void
@@ -102,6 +105,8 @@ export function useVoice(): Voice {
   const [speaking, setSpeaking] = useState(false)
   const [speaker, setSpeaker] = useState<VoiceSpeakerHit | null>(null)
   const [partial, setPartial] = useState(false)
+  const [transcribing, setTranscribing] = useState(false)
+  const [replyPhase, setReplyPhase] = useState<'thinking' | 'preparing' | null>(null)
 
   const levelRef = useRef(0)
   const ctxRef = useRef<AudioContext | null>(null)
@@ -109,6 +114,7 @@ export function useVoice(): Voice {
   const rafRef = useRef(0)
   const srRef = useRef<SpeechRecognitionLike | null>(null)
   const activeRef = useRef(false)
+  const micSequenceRef = useRef(0)
   /** true while the assistant is speaking — mic stays open but nothing is sent */
   const holdRef = useRef(false)
   const speakingRef = useRef(false)
@@ -244,28 +250,32 @@ export function useVoice(): Voice {
       return
     }
     const session = new StreamingSession({ intervalMs: 900, minBytes: 6000 })
+    const sequence = ++segmentSeqRef.current
+    const chunks: Blob[] = []
     sessionRef.current = session
-    chunksRef.current = []
+    chunksRef.current = chunks
     rec.ondataavailable = (e) => {
+      if (segmentSeqRef.current !== sequence) return
       if (e.data.size) {
-        chunksRef.current.push(e.data)
+        chunks.push(e.data)
         session.noteChunk(e.data.size, performance.now())
       }
     }
     rec.onerror = () => {
+      if (segmentSeqRef.current !== sequence) return
       recordingRef.current = false
       recRef.current = null
       sessionRef.current = null
       setError('Recording failed — check that the microphone is still connected.')
     }
     rec.onstop = () => {
+      if (segmentSeqRef.current !== sequence) return
       recRef.current = null
-      const chunks = chunksRef.current
       chunksRef.current = []
-      const captured = sessionRef.current
-      segmentSeqRef.current += 1
+      const captured = session
+      const finalSequence = ++segmentSeqRef.current
       setPartial(false)
-      if (discardRef.current) {
+      if (discardRef.current || !activeRef.current || holdRef.current) {
         discardRef.current = false
         sessionRef.current = null
         return
@@ -278,16 +288,20 @@ export function useVoice(): Voice {
       }
       const blob = new Blob(chunks, { type: chunks[0]?.type || mime })
       transcribingRef.current = true
-      setInterim(captured?.transcript ? captured.transcript : 'Transcribing…')
+      setTranscribing(true)
+      setInterim(captured.transcript || 'Transcribing…')
       void transcribeClip(cfgTarget, blob).then((out) => {
+        if (segmentSeqRef.current !== finalSequence || !activeRef.current) return
         transcribingRef.current = false
+        setTranscribing(false)
         setInterim('')
+        if (holdRef.current) return
         const partialText = captured?.transcript ?? ''
         sessionRef.current = null
         if (!out.ok) {
           // A merged partial is still a real transcript — keep it instead of
           // throwing the turn away just because the final upload failed.
-          if (partialText) {
+          if (hasSpeech(partialText)) {
             failCountRef.current = 0
             setError(null)
             setTranscript(partialText)
@@ -307,12 +321,15 @@ export function useVoice(): Voice {
         failCountRef.current = 0
         setError(null)
         const finalText = captured ? captured.finalize(out.text) : out.text
-        if (!finalText) return
+        // A quiet clip is not a turn. Silence markers survive the partial merge
+        // as text, and sending one makes ORVEX answer a question nobody asked.
+        if (!hasSpeech(finalText)) return
         setTranscript(finalText)
         feedWake(finalText)
         emitTurn(finalText, blob)
       })
     }
+    discardRef.current = false
     try {
       rec.start(streamingRef.current ? 250 : undefined)
     } catch {
@@ -383,6 +400,7 @@ export function useVoice(): Voice {
   }, [])
 
   const stop = useCallback(() => {
+    micSequenceRef.current += 1
     activeRef.current = false
     holdRef.current = false
     modeRef.current = null
@@ -392,8 +410,16 @@ export function useVoice(): Voice {
     interimRef.current = ''
     stopSegRef.current(true)
     sessionRef.current = null
+    recRef.current = null
+    chunksRef.current = []
+    transcribingRef.current = false
     segmentSeqRef.current += 1
     setPartial(false)
+    setTranscribing(false)
+    setReplyPhase(null)
+    speakingRef.current = false
+    setSpeaking(false)
+    stopSpeaking()
     try {
       srRef.current?.stop()
     } catch {
@@ -448,6 +474,7 @@ export function useVoice(): Voice {
 
   const start = useCallback(async () => {
     if (activeRef.current) return
+    const sequence = ++micSequenceRef.current
     activeRef.current = true
     setError(null)
     setSttUnavailable(null)
@@ -466,15 +493,18 @@ export function useVoice(): Voice {
       try {
         stream = await navigator.mediaDevices.getUserMedia(micConstraints(cfg.micDeviceId || null, cfg))
       } catch (e) {
+        if (micSequenceRef.current !== sequence || !activeRef.current) return
         const name = e instanceof DOMException ? e.name : ''
         if (cfg.micDeviceId && (name === 'OverconstrainedError' || name === 'NotFoundError')) {
           stream = await navigator.mediaDevices.getUserMedia(micConstraints(null, cfg))
-          setDeviceError('The selected microphone is unavailable — using the system default.')
+          if (micSequenceRef.current === sequence && activeRef.current) {
+            setDeviceError('The selected microphone is unavailable — using the system default.')
+          }
         } else {
           throw e
         }
       }
-      if (!activeRef.current) {
+      if (micSequenceRef.current !== sequence || !activeRef.current) {
         stream.getTracks().forEach((t) => t.stop())
         return
       }
@@ -544,7 +574,8 @@ export function useVoice(): Voice {
       // and POST it there instead of failing on `network`.
       const target = sttTarget(cfg)
       const mime = pickMime()
-      streamingRef.current = !!(cfg.streaming && target && mime)
+      // CPU Whisper serializes inference; partial uploads delay the final turn.
+      streamingRef.current = !!(cfg.streaming && target && mime && !isLocalWhisper(target))
       const desktop = typeof window !== 'undefined' && !!(window as unknown as { orvex?: unknown }).orvex
       if (!target && desktop) {
         // Chromium's cloud speech service is not part of the desktop runtime;
@@ -625,6 +656,7 @@ export function useVoice(): Voice {
         }
       }
     } catch (e) {
+      if (micSequenceRef.current !== sequence) return
       activeRef.current = false
       cleanupAudio()
       const name = e instanceof DOMException ? e.name : ''
@@ -672,8 +704,11 @@ export function useVoice(): Voice {
     })
   }, [refreshDevices])
 
-  // Settings changes reach a running session through this event.
+  // Settings changes reach a running session through this event. The main
+  // process learns the transcription endpoint here too, so its own Whisper
+  // server stops the moment speech input moves to a hosted one.
   useEffect(() => {
+    reportSttEndpoint(cfgRef.current)
     const onCfg = (e: Event) => {
       const next = (e as CustomEvent).detail
       if (!next) return
@@ -698,6 +733,7 @@ export function useVoice(): Voice {
       ) {
         void restartMicRef.current()
       }
+      reportSttEndpoint(cfgRef.current)
     }
     window.addEventListener('orvex-voice-config', onCfg)
     return () => window.removeEventListener('orvex-voice-config', onCfg)
@@ -705,6 +741,7 @@ export function useVoice(): Voice {
 
   useEffect(() => {
     return () => {
+      micSequenceRef.current += 1
       activeRef.current = false
       try {
         srRef.current?.abort()
@@ -747,6 +784,9 @@ export function useVoice(): Voice {
     speaking,
     speaker,
     partial,
+    transcribing,
+    replyPhase,
+    setReplyPhase,
     setWakeHandler,
     markSpeaking,
   }

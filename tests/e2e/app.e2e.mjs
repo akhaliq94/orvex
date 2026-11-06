@@ -47,7 +47,7 @@ async function main() {
   }
 
   const profile = mkdtempSync(path.join(tmpdir(), 'orvex-e2e-'))
-  const env = { ...process.env, ORVEX_USER_DATA_DIR: profile }
+  const env = { ...process.env, ORVEX_USER_DATA_DIR: profile, ORVEX_DISABLE_LOCAL_WHISPER: '1' }
   delete env.VITE_DEV_URL
 
   const launchOptions =

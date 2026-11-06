@@ -115,10 +115,11 @@ function pruneImages(history, keep = 2) {
  * One model step through the shared gateway: retries on 429/5xx, provider
  * fallback, real token/cost accounting and circuit breakers all live there.
  */
-async function callModel(candidates, { system, history, tools, signal, noImages, onWait, onEvent, runId, task }) {
+async function callModel(candidates, { system, history, tools, signal, noImages, onWait, onEvent, onDelta, runId, task }) {
   const startedAt = Date.now();
-  // A slow CPU model can sit here for minutes — say so instead of looking hung.
-  const ticker = onWait
+  // A slow CPU model can sit here for minutes — say so instead of looking hung,
+  // until the answer itself starts arriving.
+  let ticker = onWait
     ? setInterval(() => {
         try {
           onWait(Math.round((Date.now() - startedAt) / 1000));
@@ -127,6 +128,17 @@ async function callModel(candidates, { system, history, tools, signal, noImages,
         }
       }, 20000)
     : null;
+  const stopTicker = () => {
+    if (!ticker) return;
+    clearInterval(ticker);
+    ticker = null;
+  };
+  const deltas = onDelta
+    ? (delta, full) => {
+        stopTicker();
+        onDelta(delta, full);
+      }
+    : undefined;
   try {
     return await gateway.chat({
       candidates,
@@ -139,10 +151,12 @@ async function callModel(candidates, { system, history, tools, signal, noImages,
       noImages,
       temperature: 0.2,
       maxTokens: 2048,
+      stream: !!onDelta,
+      onDelta: deltas,
       onEvent,
     });
   } finally {
-    if (ticker) clearInterval(ticker);
+    stopTicker();
   }
 }
 
@@ -263,7 +277,10 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
 
     let reply;
     let retriedWithoutImages = false;
+    let retriedWithoutStream = false;
+    let sawDelta = false;
     for (;;) {
+      sawDelta = false;
       try {
         reply = await callModel(chain, {
           system: `${system}\n\n${planPrompt()}`,
@@ -274,6 +291,14 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
           runId,
           task,
           onWait: (secs) => emit({ type: 'status', text: `${primary.name || primary.model} is still working — ${secs}s` }),
+          // The answer is shown and spoken while it is still being written, so
+          // nothing unguarded is ever put in front of the user.
+          onDelta: retriedWithoutStream
+            ? undefined
+            : (_delta, full) => {
+                sawDelta = true;
+                emit({ type: 'answer_delta', text: security.outputTripwire(full).text });
+              },
           onEvent: (e) => {
             if (!e) return;
             if (e.type === 'model_retry') {
@@ -296,6 +321,13 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
           return finish({ ok: false, cancelled: true, summary: 'Stopped by user.' });
         }
         const message = err && err.message ? err.message : String(err);
+        // Streaming is what makes an answer arrive early, but a provider that
+        // cannot hold an open stream must still get asked for the reply.
+        if (!retriedWithoutStream && !sawDelta && /stream/i.test(message)) {
+          retriedWithoutStream = true;
+          emit({ type: 'status', text: `${primary.name || primary.model} does not stream its answer — asking for the whole reply instead.` });
+          continue;
+        }
         if (attachImages && !retriedWithoutImages && /image|vision|multimodal/i.test(message)) {
           attachImages = false;
           retriedWithoutImages = true;

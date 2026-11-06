@@ -59,6 +59,8 @@ const devices = require('./devices.cjs');
 const a2a = require('./a2a.cjs');
 const training = require('./training.cjs');
 const localBrain = require('./local-brain.cjs');
+const whisperLocal = require('./whisper-local.cjs');
+const sttKeys = require('./stt-keys.cjs');
 const learner = require('./learner.cjs');
 const workforce = require('./workforce.cjs');
 const maker = require('./maker.cjs');
@@ -224,6 +226,8 @@ function haltEverything(reason) {
     }
   }
   llmStreams.clear();
+  for (const entry of speechStreams.values()) entry.controller.abort();
+  speechStreams.clear();
   try {
     collab.stopAll(`Emergency stop: ${reason}`);
   } catch {
@@ -1130,6 +1134,10 @@ async function preflightProvider(provider) {
 /** Tasks the routing editor can assign model chains to. */
 const ROUTING_TASKS = ['agent', 'chat', 'code', 'research', 'memory', 'summarize', 'vision', 'plan', 'media'];
 const llmStreams = new Map();
+/** Live HeyGen speech streams keyed by window and request id. */
+const speechStreams = new Map();
+const SPEECH_STREAMS_PER_WINDOW = 4;
+const speechKey = (senderId, id) => `${senderId}:${id}`;
 
 function uniqueCandidates(list) {
   const out = [];
@@ -1243,6 +1251,127 @@ function boundSecretOrEmpty(id, url) {
     throw new Error(`The saved ${id} key belongs to ${bound}, not this endpoint. Save the key again for this endpoint.`);
   }
   return vault.peek(id) || '';
+}
+
+const STT_ENDPOINT_SETTING = 'stt.endpoint';
+
+/**
+ * Local Whisper shares the machine's few cores with the model, so it only runs
+ * when speech input actually points at it. An unset endpoint is the original
+ * behaviour: the app owns its own transcription server.
+ */
+function localWhisperWanted() {
+  const saved = String(db.getSetting(STT_ENDPOINT_SETTING, '') || '').trim();
+  if (!saved) return true;
+  try {
+    const u = new URL(saved);
+    return ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname) && u.port === String(whisperLocal.PORT);
+  } catch {
+    return true;
+  }
+}
+
+function syncLocalWhisper() {
+  if (!localWhisperWanted()) {
+    whisperLocal.stop();
+    return false;
+  }
+  void whisperLocal
+    .start()
+    .then((state) => {
+      if (state.error) console.error('Local whisper server failed:', state.error);
+    })
+    .catch((err) => console.error('Local whisper server failed:', err && err.message ? err.message : err));
+  return true;
+}
+
+/**
+ * Hosted speech input needs the same key the chat provider already has, and
+ * asking for it twice only gives the secret one more place to leak from. This
+ * copies it inside the main process, and only from a provider already bound to
+ * the exact origin the transcription endpoint uses.
+ */
+async function linkSttKeyFromProvider(target) {
+  const origin = originOf(target);
+  if (!origin) throw new Error('Set a transcription endpoint first.');
+  const blocked = security.networkPolicyBlock(target);
+  if (blocked) throw new Error(blocked);
+  const bindings = providerBindings();
+  const ids = Object.keys(bindings).filter((id) => id !== 'stt' && originOf(bindings[id]) === origin);
+  if (!ids.length) {
+    throw new Error(`No saved provider key is linked to ${origin}. Add that provider in Settings → Providers, or paste the key once here.`);
+  }
+  const source = ids.map((id) => ({ id, key: vault.peek(id) })).find((row) => row.key);
+  if (!source) throw new Error(`The provider for ${origin} has no saved key to reuse.`);
+  await vault.set('stt', source.key);
+  saveProviderBinding('stt', bindings[source.id]);
+  security.setSecretValues(Object.values(await vault.load()));
+  return { linked: true, provider: source.id };
+}
+
+const STT_POOL_VAULT_ID = 'stt.pool';
+const STT_POOL_HEALTH_SETTING = 'stt.keyHealth';
+
+/**
+ * The pool as stored: one list of keys per endpoint origin. A hosted quota
+ * belongs to one service, so switching speech input between Groq, OpenAI and
+ * ElevenLabs must not drop the keys saved for the others.
+ */
+function poolTables(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [origin, rows] of Object.entries(raw)) {
+    const clean = sttKeys.normalisePool(rows);
+    if (clean.length) out[origin] = clean;
+  }
+  return out;
+}
+
+async function readSttPool(origin) {
+  return poolTables(await vault.getJson(STT_POOL_VAULT_ID))[origin] || [];
+}
+
+function sttPoolHealth() {
+  const saved = db.getSetting(STT_POOL_HEALTH_SETTING, {});
+  return saved && typeof saved === 'object' ? saved : {};
+}
+
+async function writeSttPool(origin, rows) {
+  const tables = poolTables(await vault.getJson(STT_POOL_VAULT_ID));
+  if (rows.length) tables[origin] = rows;
+  else delete tables[origin];
+  await vault.setJson(STT_POOL_VAULT_ID, Object.keys(tables).length ? tables : null);
+  // the pool lives as one JSON entry, so its values are added to the redaction
+  // list by hand rather than read back as strings
+  const stored = Object.values(await vault.load()).filter((value) => typeof value === 'string');
+  const pooled = Object.values(tables).flat().map((row) => row.key);
+  security.setSecretValues([...stored, ...pooled]);
+}
+
+/**
+ * Keys this endpoint may use, in the order they should be tried. The single
+ * key pasted in Settings comes first; the pool behind it is what keeps a
+ * conversation running when one quota runs out.
+ */
+async function sttKeyAttempts(target) {
+  const out = [];
+  const seen = new Set();
+  const single = boundSecretOrEmpty('stt', target);
+  if (single) {
+    out.push({ id: 'stt', key: single });
+    seen.add(single);
+  }
+  const origin = originOf(target);
+  if (origin) {
+    const pool = await readSttPool(origin);
+    for (const pick of sttKeys.pickOrder(pool, sttPoolHealth())) {
+      const entry = pool.find((row) => row.id === pick.id);
+      if (!entry || !entry.key || seen.has(entry.key)) continue;
+      seen.add(entry.key);
+      out.push({ id: entry.id, key: entry.key });
+    }
+  }
+  return out;
 }
 
 function withMediaKey(payload, id) {
@@ -1437,7 +1566,7 @@ function handle(channel, fn) {
     const blocked = security.channelBlocked(channel);
     if (blocked) return fail(new Error(blocked));
     try {
-      return ok(await fn(payload));
+      return ok(await fn(payload, _event));
     } catch (err) {
       return fail(err);
     }
@@ -2806,8 +2935,65 @@ function registerIpc() {
     return creative.heygenVoices({ ...p, key: boundSecretOrEmpty('heygen', 'https://api.heygen.com') });
   });
   handle('orvex:media:heygenTts', (payload = {}) => {
+    const net = security.networkPolicyBlock('https://api.heygen.com');
+    if (net) throw new Error(net);
     const p = payload && typeof payload === 'object' ? payload : {};
     return creative.heygenSpeak({ ...p, key: boundSecretOrEmpty('heygen', 'https://api.heygen.com') });
+  });
+  handle('orvex:media:heygenTtsStream', async (payload = {}, event) => {
+    const sender = event.sender;
+    if (![win, mini].some((w) => w && !w.isDestroyed() && w.webContents === sender)) throw new Error('Unknown speech client.');
+    const net = security.networkPolicyBlock('https://api.heygen.com');
+    if (net) throw new Error(net);
+    const id = String(payload.id || '');
+    if (!/^[a-zA-Z0-9-]{1,80}$/.test(id)) throw new Error('Invalid speech request id.');
+    // One reply is spoken sentence by sentence, so several streams from the
+    // same window are live at once. Each id keeps its own controller; the
+    // oldest rolls over when a window exceeds the pool.
+    const key = speechKey(sender.id, id);
+    const previous = speechStreams.get(key);
+    if (previous) {
+      previous.controller.abort();
+      speechStreams.delete(key);
+    }
+    const live = [];
+    for (const [k, entry] of speechStreams) if (entry.senderId === sender.id) live.push(k);
+    while (live.length >= SPEECH_STREAMS_PER_WINDOW) {
+      const oldest = live.shift();
+      speechStreams.get(oldest).controller.abort();
+      speechStreams.delete(oldest);
+    }
+    const controller = new AbortController();
+    const entry = { id, senderId: sender.id, controller };
+    speechStreams.set(key, entry);
+    const abort = () => controller.abort();
+    sender.once('destroyed', abort);
+    sender.once('render-process-gone', abort);
+    sender.once('did-start-navigation', abort);
+    try {
+      return await creative.heygenSpeakStream({
+        text: payload.text, voiceId: payload.voiceId, model: payload.model,
+        language: payload.language, speed: payload.speed,
+        key: boundSecretOrEmpty('heygen', 'https://api.heygen.com'),
+        signal: controller.signal,
+        onAudio: (part) => {
+          const blocked = security.channelBlocked('orvex:media:heygenTtsStream') || security.networkPolicyBlock('https://api.heygen.com');
+          if (blocked) { controller.abort(); throw new Error(blocked); }
+          if (!controller.signal.aborted && !sender.isDestroyed()) sender.send('orvex:media:heygenAudio', { id, ...part });
+        },
+      });
+    } finally {
+      sender.removeListener('destroyed', abort);
+      sender.removeListener('render-process-gone', abort);
+      sender.removeListener('did-start-navigation', abort);
+      if (speechStreams.get(key) === entry) speechStreams.delete(key);
+    }
+  });
+  ipcMain.handle('orvex:media:stopHeygenTts', (event, { id } = {}) => {
+    const entry = speechStreams.get(speechKey(event.sender.id, String(id || '')));
+    if (!entry) return ok({ stopped: false });
+    entry.controller.abort();
+    return ok({ stopped: true });
   });
 
   /* Speech-to-text proxy: audio plus a stored key never meet in the renderer. */
@@ -2815,8 +3001,100 @@ function registerIpc() {
     const target = String(url || '').trim();
     const net = security.networkPolicyBlock(target);
     if (net) throw new Error(net);
-    const key = boundSecretOrEmpty('stt', target);
-    return sttProxy.transcribeAudio({ url: target, key, audio, type, model, timeoutMs });
+    const attempts = await sttKeyAttempts(target);
+    if (attempts.length <= 1) {
+      return sttProxy.transcribeAudio({ url: target, key: attempts.length ? attempts[0].key : '', audio, type, model, timeoutMs });
+    }
+    let health = sttPoolHealth();
+    let lastError = null;
+    let moved = false;
+    const refused = [];
+    for (const attempt of attempts) {
+      try {
+        const answer = await sttProxy.transcribeAudio({ url: target, key: attempt.key, audio, type, model, timeoutMs });
+        // the keys that refused this clip stay parked, or the next turn walks
+        // through a dead quota all over again
+        if (moved) db.setSetting(STT_POOL_HEALTH_SETTING, sttKeys.withSuccess(health, attempt.id));
+        return answer;
+      } catch (err) {
+        const kind = sttKeys.classifyError(err);
+        // a bad request or a dead service fails the same way for every key, so
+        // only a refusal aimed at this credential moves on to the next one
+        if (!sttKeys.shouldRotate(kind)) throw err;
+        refused.push(attempt.id);
+        lastError = err;
+        moved = true;
+        health = sttKeys.withFailure(health, attempt.id, kind, Date.now(), err && err.message ? err.message : String(err));
+      }
+    }
+    db.setSetting(STT_POOL_HEALTH_SETTING, health);
+    const detail = lastError && lastError.message ? ` Last answer: ${lastError.message}` : '';
+    throw new Error(`All ${refused.length} saved transcription keys were refused by this endpoint.${detail}`);
+  });
+  handle('orvex:stt:setEndpoint', ({ url } = {}) => {
+    const value = String(url || '').trim().slice(0, 500);
+    if (value) {
+      const net = security.networkPolicyBlock(value);
+      if (net) throw new Error(net);
+    }
+    db.setSetting(STT_ENDPOINT_SETTING, value);
+    return { local: syncLocalWhisper() };
+  });
+  handle('orvex:stt:useProviderKey', async ({ url } = {}) => linkSttKeyFromProvider(String(url || '').trim()));
+
+  /* Speech input key pool: presence, labels and status only — values stay here. */
+  handle('orvex:stt:keys:list', async ({ url } = {}) => {
+    const origin = originOf(String(url || '').trim());
+    const tables = poolTables(await vault.getJson(STT_POOL_VAULT_ID));
+    const health = sttPoolHealth();
+    return {
+      limit: sttKeys.MAX_KEYS,
+      keys: (tables[origin] || []).map((entry) => sttKeys.describe(entry, health)),
+      savedFor: origin,
+      others: Object.entries(tables)
+        .filter(([where]) => where !== origin)
+        .reduce((sum, [, rows]) => sum + rows.length, 0),
+      hasSingleKey: !!(await vault.get('stt')),
+    };
+  });
+  handle('orvex:stt:keys:add', async ({ url, key, label } = {}) => {
+    const target = String(url || '').trim();
+    if (!target) throw new Error('Pick a speech input endpoint first.');
+    const blocked = security.networkPolicyBlock(target);
+    if (blocked) throw new Error(blocked);
+    const origin = originOf(target);
+    if (!origin) throw new Error('That endpoint URL is not valid.');
+    const value = String(key || '').trim();
+    if (!value) throw new Error('Paste the key you want to add.');
+    let pool = await readSttPool(origin);
+    if (pool.some((entry) => entry.key === value)) return { added: false, count: pool.length, reason: 'That key is already in the list.' };
+    if (pool.length >= sttKeys.MAX_KEYS) throw new Error(`ORVEX keeps ${sttKeys.MAX_KEYS} keys per endpoint — remove one first.`);
+    pool = sttKeys.normalisePool([...pool, { id: sttKeys.newKeyId(), label: String(label || '').trim(), key: value, addedAt: Date.now() }]);
+    await writeSttPool(origin, pool);
+    return { added: true, count: pool.length };
+  });
+  handle('orvex:stt:keys:remove', async ({ id, url } = {}) => {
+    const wanted = String(id || '');
+    if (wanted === 'stt') throw new Error('Clear the single STT key field to remove that one.');
+    const origin = originOf(String(url || '').trim());
+    const pool = (await readSttPool(origin)).filter((entry) => entry.id !== wanted);
+    await writeSttPool(origin, pool);
+    const health = { ...sttPoolHealth() };
+    delete health[wanted];
+    db.setSetting(STT_POOL_HEALTH_SETTING, health);
+    return { count: pool.length };
+  });
+  handle('orvex:stt:keys:reset', () => {
+    db.setSetting(STT_POOL_HEALTH_SETTING, {});
+    return { cleared: true };
+  });
+  handle('orvex:stt:models', async ({ url } = {}) => {
+    const target = String(url || '').trim();
+    if (!target) throw new Error('Pick a speech input endpoint first.');
+    const blocked = security.networkPolicyBlock(target);
+    if (blocked) throw new Error(blocked);
+    const attempts = await sttKeyAttempts(target);
+    return sttProxy.listModels({ url: target, key: attempts.length ? attempts[0].key : '' });
   });
   handle('orvex:media:inspect3d', (payload = {}) => creative.inspect3D(payload || {}));
   handle('orvex:media:saveText', (payload = {}) => creative.saveText(payload || {}));
@@ -3782,6 +4060,7 @@ if (!gotLock) {
     registerIpc();
     registerMediaProtocol();
     createWindow();
+    syncLocalWhisper();
     setupTray();
     setupHotkey();
     setupAirStopHotkey();
@@ -3874,6 +4153,7 @@ if (!gotLock) {
   app.on('will-quit', () => {
     globalShortcut.unregisterAll();
     gamePilot.shutdown();
+    whisperLocal.stop();
     localBrain.shutdown().catch(() => {});
     maker.stopAll().catch(() => {});
   });
@@ -3886,6 +4166,8 @@ if (!gotLock) {
     }
     for (const controller of llmStreams.values()) controller.abort();
     llmStreams.clear();
+    for (const entry of speechStreams.values()) entry.controller.abort();
+    speechStreams.clear();
     for (const entry of pendingAdvancedApprovals.values()) {
       clearTimeout(entry.timer);
       entry.done(false);

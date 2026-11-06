@@ -2551,6 +2551,27 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.stt-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 11px;
+  padding: 8px 9px;
+  border-radius: 9px;
+  border: 1px solid rgba(var(--border-rgb), 0.16);
+}
+.stt-key-row { display: flex; align-items: center; gap: 8px; font-size: 9.5px; }
+.stt-key-row .sk-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.stt-key-row .sk-state { color: var(--faint); }
+.stt-key-row .sk-state.warn { color: #fbbf24; }
+.stt-key-row .sk-state.bad { color: #ff6b78; }
 
 /* ---------- light theme overrides for settings ---------- */
 [data-theme='light'] .settings-block { background: rgba(255, 255, 255, 0.42); }
