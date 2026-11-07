@@ -62,26 +62,26 @@ function usable(p: ProviderConfig) {
 
 /**
  * Every model ORVEX may fail over to for a run: the active provider first, then
- * enabled local servers and keyed hosted providers. Keyless hosted providers are
- * skipped as fallbacks because they can only fail with a 401.
+ * other enabled hosted providers that have a key.
+ *
+ * Local servers (Ollama, LM Studio, llama.cpp) are never added on their own: a
+ * local model runs only when the user selects it as the active provider, so a
+ * cloud conversation can never silently continue on a local model. Picking a
+ * local provider is equally exclusive — it is not mixed with cloud fallbacks.
  */
 export function buildCandidates(providers: ProviderConfig[], activeId: string | null): OrvexAgentProvider[] {
   const active = providers.find((p) => p.id === activeId) ?? null
   const out: ProviderConfig[] = []
   if (active && active.baseUrl && active.model) out.push(active)
+  if (active?.kind === 'local') return out.map(toCandidate)
   for (const p of providers) {
     if (p.id === active?.id) continue
     if (!usable(p)) continue
-    if (p.kind !== 'local' && !p.apiKey && !p.hasKey) continue
+    if (p.kind === 'local') continue
+    if (!p.apiKey && !p.hasKey) continue
     out.push(p)
   }
   return out.map(toCandidate)
-}
-
-/** The local model used for hybrid compression, kept separate from the main chain. */
-export function pickLocal(providers: ProviderConfig[], activeId: string | null): OrvexAgentProvider | null {
-  const p = providers.find((x) => x.id !== activeId && x.enabled && x.kind === 'local' && x.baseUrl && x.model)
-  return p ? toCandidate(p) : null
 }
 
 /** Re-order candidates using the saved route for a task; unmatched entries stay at the end. */

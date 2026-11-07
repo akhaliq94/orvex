@@ -50,6 +50,14 @@ import {
   type SttKeyList,
 } from '../data/stt'
 import { HEYGEN_MODELS, fetchHeygenVoices, hasHeygenKey, saveHeygenKey, type HeygenVoice } from '../data/heygen'
+import {
+  ELEVEN_MODELS,
+  fetchElevenModels,
+  fetchElevenVoices,
+  hasElevenKey,
+  voiceLabel,
+  type ElevenVoice,
+} from '../data/elevenlabs'
 import type { Theme } from '../themes'
 import type {
   OrvexAppPrefs,
@@ -372,7 +380,7 @@ const QUICK_CLOUD: { presetId: string; label: string; model: string; note: strin
   {
     presetId: 'groq',
     label: 'Groq',
-    model: 'llama-3.3-70b-versatile',
+    model: 'openai/gpt-oss-120b',
     note: 'Fastest tool calls. Free tier key from console.groq.com.',
   },
   {
@@ -433,7 +441,10 @@ function ProvidersTab({ notify }: { notify: (m: string) => void }) {
     }
     const { ids, free } = await applyRemote(p, remote, true)
     setPulling(null)
-    notify(`${p.name}: ${ids.length} models imported${free.length ? ` · ${free.length} free` : ''}`)
+    const skipped = remote.skipped?.length ?? 0
+    notify(
+      `${p.name}: ${ids.length} chat models imported${free.length ? ` · ${free.length} free` : ''}${skipped ? ` · ${skipped} speech/classifier skipped` : ''}`,
+    )
   }
 
   // A pasted API key should fill the model dropdown without an extra click.
@@ -926,7 +937,8 @@ function RoutingTab({ notify }: { notify: (m: string) => void }) {
         <p className="settings-note">
           Each task gets its own model chain: the first entry answers, the rest are fallbacks tried automatically when a
           provider is rate-limited, down or rejects the request. Leave a chain empty to use the active provider first, then
-          every other enabled model. Chains are stored in the desktop database, and every call records real tokens and cost.
+          every other enabled cloud model that has a key. Local models are never added on their own — one runs only when you
+          select it as the active provider. Chains are stored in the desktop database, and every call records real tokens and cost.
         </p>
 
         {!bridge && (
@@ -1647,10 +1659,17 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
   const [poolBusy, setPoolBusy] = useState(false)
   const [asrModels, setAsrModels] = useState<string[]>([])
   const [asrModelMsg, setAsrModelMsg] = useState('')
+  const [elevenSaved, setElevenSaved] = useState(false)
+  const [elevenVoices, setElevenVoices] = useState<ElevenVoice[]>([])
+  const [elevenModels, setElevenModels] = useState<string[]>([])
+  const [elevenFilter, setElevenFilter] = useState('')
+  const [elevenBusy, setElevenBusy] = useState(false)
+  const [elevenMsg, setElevenMsg] = useState('')
 
   useEffect(() => {
     void hasSttKey().then(setSttSaved)
     void hasHeygenKey().then(setHeygenSaved)
+    void hasElevenKey().then(setElevenSaved)
   }, [])
 
   const asrEndpoint = sttTarget(cfg)?.url || ''
@@ -1690,6 +1709,48 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
     notify(`HeyGen — ${res.voices.length} voices fetched`)
   }
 
+  const pullElevenVoices = async () => {
+    setElevenBusy(true)
+    const res = await fetchElevenVoices()
+    setElevenBusy(false)
+    if (!res.ok) {
+      setElevenMsg(res.detail)
+      notify(`ElevenLabs voices — ${res.detail}`)
+      return
+    }
+    setElevenVoices(res.voices)
+    setElevenMsg(`${res.voices.length} voices on this account.`)
+    if (res.voices.length && !res.voices.some((v) => v.voiceId === cfg.elevenVoiceId)) {
+      setCfg({ elevenVoiceId: res.voices[0].voiceId })
+    }
+    notify(`ElevenLabs — ${res.voices.length} voices fetched`)
+  }
+
+  const pullElevenModels = async () => {
+    setElevenBusy(true)
+    const res = await fetchElevenModels()
+    setElevenBusy(false)
+    if (!res.ok) {
+      setElevenMsg(res.detail)
+      notify(`ElevenLabs models — ${res.detail}`)
+      return
+    }
+    setElevenModels(res.models)
+    setElevenMsg(`${res.models.length} speech models from the ${res.source}.`)
+    notify(`ElevenLabs — ${res.models.length} models fetched`)
+  }
+
+  const elevenQuery = elevenFilter.trim().toLowerCase()
+  const elevenMatches = elevenQuery
+    ? elevenVoices.filter((v) => voiceLabel(v).toLowerCase().includes(elevenQuery))
+    : elevenVoices
+  const elevenShown = elevenMatches.slice(0, 200)
+  const elevenSelected =
+    cfg.elevenVoiceId && !elevenShown.some((v) => v.voiceId === cfg.elevenVoiceId)
+      ? elevenVoices.find((v) => v.voiceId === cfg.elevenVoiceId)
+      : undefined
+  const elevenModelOptions = elevenModels.length ? elevenModels : ELEVEN_MODELS.map((m) => m.id)
+
   const heygenVoiceOptions = heygenVoices.length
     ? heygenVoices
     : cfg.heygenVoiceId
@@ -1720,6 +1781,7 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
     if (res.ok) {
       setSttSaved(!!sttKey.trim())
       setSttKey('')
+      void hasElevenKey().then(setElevenSaved)
     }
     notify(res.detail)
   }
@@ -1776,6 +1838,7 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
       setPoolLabel('')
       setPool(await listSttKeys(asrEndpoint))
       void hasSttKey().then(setSttSaved)
+      void hasElevenKey().then(setElevenSaved)
     }
     notify(res.detail)
   }
@@ -1960,6 +2023,93 @@ function VoiceTab({ notify }: { notify: (m: string) => void }) {
             placeholder="en"
           />
         </div>
+
+        <div className="settings-block-head mt-4">
+          <h3 className="settings-h">ElevenLabs — live voice</h3>
+          <span className="sec-chip">{elevenSaved ? 'key ready' : 'no key'}</span>
+        </div>
+        <p className="settings-note">
+          Speech output uses the ElevenLabs key already saved for speech input below, including the backup key list — one
+          key list covers listening and talking. Flash v2.5 starts speaking in a few hundred milliseconds, which is what
+          makes a spoken conversation feel live instead of turn-by-turn.
+        </p>
+        <div className="field-row">
+          <label className="field-label" htmlFor="eleven-model">Model</label>
+          <div className="field-inline">
+            <select
+              id="eleven-model"
+              className="select"
+              value={cfg.elevenModel}
+              onChange={(e) => setCfg({ elevenModel: e.target.value })}
+            >
+              {!elevenModelOptions.includes(cfg.elevenModel) && !!cfg.elevenModel && (
+                <option value={cfg.elevenModel}>{cfg.elevenModel}</option>
+              )}
+              {elevenModelOptions.map((id) => (
+                <option key={id} value={id}>
+                  {ELEVEN_MODELS.find((m) => m.id === id)?.name ?? id}
+                </option>
+              ))}
+            </select>
+            <button className="ghost-btn" disabled={elevenBusy || !elevenSaved} onClick={() => void pullElevenModels()}>
+              {elevenBusy ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />} Fetch models
+            </button>
+          </div>
+        </div>
+        <p className="settings-note" style={{ marginTop: -4 }}>
+          {ELEVEN_MODELS.find((m) => m.id === cfg.elevenModel)?.note ?? 'A model id from your account.'}
+        </p>
+        <div className="field-row">
+          <label className="field-label" htmlFor="eleven-voice">Voice</label>
+          <div className="field-inline">
+            <select
+              id="eleven-voice"
+              className="select"
+              value={cfg.elevenVoiceId}
+              onChange={(e) => setCfg({ elevenVoiceId: e.target.value })}
+            >
+              {!cfg.elevenVoiceId && <option value="">pick a voice — fetch the list first</option>}
+              {elevenSelected && (
+                <option key={elevenSelected.voiceId} value={elevenSelected.voiceId}>
+                  {voiceLabel(elevenSelected)}
+                </option>
+              )}
+              {elevenShown.map((v) => (
+                <option key={v.voiceId} value={v.voiceId}>
+                  {voiceLabel(v)}
+                </option>
+              ))}
+            </select>
+            <button className="ghost-btn" disabled={elevenBusy || !elevenSaved} onClick={() => void pullElevenVoices()}>
+              {elevenBusy ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />} Fetch voices
+            </button>
+          </div>
+        </div>
+        {!!elevenVoices.length && (
+          <div className="field-row">
+            <label className="field-label" htmlFor="eleven-voice-filter">Find a voice</label>
+            <input
+              id="eleven-voice-filter"
+              className="text-input"
+              value={elevenFilter}
+              onChange={(e) => setElevenFilter(e.target.value)}
+              placeholder="name, accent, gender or use case"
+            />
+          </div>
+        )}
+        {!!elevenVoices.length && (
+          <p className="settings-note">
+            {elevenMatches.length} of {elevenVoices.length} voices match
+            {elevenMatches.length > 200 ? ' — showing the first 200, keep typing to narrow' : ''}.
+          </p>
+        )}
+        {elevenMsg && <p className="settings-note">{elevenMsg}</p>}
+        {!elevenSaved && (
+          <p className="settings-note">
+            No ElevenLabs key is saved for this endpoint yet. Pick ElevenLabs as the speech input source below and add the
+            key there — speech output picks it up automatically.
+          </p>
+        )}
 
         <div className="field-row mt-4">
           <label className="field-label" htmlFor="tts-url">TTS server URL</label>

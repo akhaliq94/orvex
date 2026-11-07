@@ -82,6 +82,17 @@ contextBridge.exposeInMainWorld('orvex', {
       remove: (id, url) => invoke('orvex:stt:keys:remove', { id, url }),
       reset: () => invoke('orvex:stt:keys:reset', {}),
     },
+    realtime: {
+      start: (payload) => invoke('orvex:stt:realtime:start', payload || {}),
+      audio: (id, audio, commit) => invoke('orvex:stt:realtime:audio', { id, audio, commit: !!commit }),
+      commit: (id) => invoke('orvex:stt:realtime:commit', { id }),
+      stop: (id) => invoke('orvex:stt:realtime:stop', { id }),
+      onEvent: (cb) => {
+        const handler = (_event, data) => cb(data);
+        ipcRenderer.on('orvex:stt:realtime-event', handler);
+        return () => ipcRenderer.removeListener('orvex:stt:realtime-event', handler);
+      },
+    },
   },
   routing: {
     get: () => invoke('orvex:routing:get'),
@@ -299,6 +310,15 @@ contextBridge.exposeInMainWorld('orvex', {
       const handler = (_event, data) => cb(data);
       ipcRenderer.on('orvex:media:heygenAudio', handler);
       return () => ipcRenderer.removeListener('orvex:media:heygenAudio', handler);
+    },
+    elevenVoices: () => invoke('orvex:media:elevenVoices', {}),
+    elevenModels: () => invoke('orvex:media:elevenModels', {}),
+    elevenTtsStream: (payload) => invoke('orvex:media:elevenTtsStream', payload),
+    stopElevenTts: (id) => invoke('orvex:media:stopElevenTts', { id }),
+    onElevenAudio: (cb) => {
+      const handler = (_event, data) => cb(data);
+      ipcRenderer.on('orvex:media:elevenAudio', handler);
+      return () => ipcRenderer.removeListener('orvex:media:elevenAudio', handler);
     },
     music: (payload) => invoke('orvex:media:music', payload),
     inspect3d: (path) => invoke('orvex:media:inspect3d', { path }),

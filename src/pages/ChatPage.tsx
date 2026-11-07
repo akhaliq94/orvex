@@ -21,8 +21,8 @@ import { useProviders } from '../hooks/useProviders'
 import { useHumanAgent } from '../hooks/useHumanAgent'
 import { useLLM, type LLMMessage } from '../hooks/useLLM'
 import { loadConversations, saveConversations, upsertConversation, formatTime, titleFrom, type Conversation } from '../data/memory'
-import { buildCandidates, orderForTask, pickLocal } from '../data/routing'
-import { AGENT_PROFILES, HUMANITY_PROMPT } from '../data/agents'
+import { buildCandidates, orderForTask } from '../data/routing'
+import { AGENT_PROFILES, HUMANITY_PROMPT, LANGUAGE_PROMPT } from '../data/agents'
 import { beginReplySpeech, speak, stopSpeaking, useVoiceSettings } from '../data/voice'
 import type { ReplySpeech } from '../data/voice'
 import { logFailure, pushNotification } from '../data/stores'
@@ -630,9 +630,9 @@ export default function ChatPage({
 
     const currentAgent = AGENT_PROFILES.find((a) => a.id === activeAgentId) ?? AGENT_PROFILES[0]
     const voicePrompt = handsFreeRef.current || wakeTurnRef.current
-      ? 'This is a live voice conversation. Match the user’s language. For ordinary conversation, answer naturally in one or two short sentences without markdown unless they ask for detail. Use tools only when the request needs an action or current information.'
+      ? 'This is a live voice conversation. The user has finished speaking before you were given this turn; do not ask them to repeat themselves. Answer naturally in one or two short sentences without markdown unless they ask for detail. Use tools only when the request needs an action or current information.'
       : ''
-    const sysPrompt = `${currentAgent.persona}\n\n${HUMANITY_PROMPT}\n\n${voicePrompt}`
+    const sysPrompt = `${currentAgent.persona}\n\n${HUMANITY_PROMPT}\n\n${LANGUAGE_PROMPT}\n\n${voicePrompt}`
 
     const historyMsgs: LLMMessage[] = priorMsgs
       .slice(-10)
@@ -677,9 +677,12 @@ export default function ChatPage({
         agentId: activeAgentId,
         provider: { id: active.id, presetId: active.presetId, name: active.name, baseUrl: active.baseUrl, apiKey: active.apiKey, api: active.api, model: active.model },
         candidates: agentCandidates,
-        local: pickLocal(providers, activeId),
+        // No implicit local helper: a local model only runs when the user picks
+        // one as the active provider, never as an automatic fallback.
+        local: null,
         autoApprove: fullAutoRef.current,
         task: 'agent',
+        compactTools: !!voicePrompt,
       })
       if (!res.ok) {
         awaitingAgentRef.current = false

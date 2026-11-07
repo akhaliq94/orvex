@@ -16,7 +16,7 @@ import PageShell from './PageShell'
 import AICore from '../components/AICore'
 import type { Voice } from '../hooks/useVoice'
 import { useLevelMotion } from '../hooks/useLevelMotion'
-import { useVoiceSettings } from '../data/voice'
+import { STT_LANGUAGES, useVoiceSettings } from '../data/voice'
 import { transcribeAudio } from '../data/voicestudio'
 import { micConstraints } from '../voice/devices'
 import { addProfile, identify, loadProfiles, removeProfile, vectorFromBlob, type SpeakerProfile } from '../voice/speaker'
@@ -356,6 +356,29 @@ export default function VoicePage({ onBack, voice, onToggleListening, notify }: 
             </div>
           </section>
 
+          <section className="voice-card panel" aria-label="Spoken language">
+            <div className="voice-card-head">
+              <h3 className="voice-card-title">Spoken language</h3>
+              <span className="voice-chip">{STT_LANGUAGES.find((l) => l.id === cfg.sttLanguage)?.name ?? 'Auto-detect'}</span>
+            </div>
+            <div className="voice-device-row">
+              <select
+                className="select"
+                aria-label="Speech input language"
+                value={cfg.sttLanguage}
+                onChange={(e) => setCfg({ sttLanguage: e.target.value })}
+              >
+                {STT_LANGUAGES.map((l) => (
+                  <option key={l.id || 'auto'} value={l.id}>{l.name}</option>
+                ))}
+              </select>
+            </div>
+            <p className="voice-card-note">
+              Telling the transcriber the language keeps Urdu speech out of Devanagari — Hindi and Urdu sound almost the same to a multilingual
+              model. Auto-detect guesses and often writes Hindi.
+            </p>
+          </section>
+
           <section className="voice-card panel" aria-label="Wake word">
             <div className="voice-card-head">
               <Radio size={13} />
@@ -408,6 +431,15 @@ export default function VoicePage({ onBack, voice, onToggleListening, notify }: 
             <p className="voice-card-note">
               The growing turn is re-sent to the transcription endpoint about once a second and overlapping results are merged.
               {cfg.streaming ? '' : ' Off — only the finished turn is transcribed.'}
+            </p>
+            <label className="voice-check">
+              <input type="checkbox" checked={cfg.realtimeStt} onChange={(e) => setCfg({ realtimeStt: e.target.checked })} />
+              Live input — stream the mic to ElevenLabs Scribe in real time
+            </label>
+            <p className="voice-card-note">
+              {cfg.realtimeStt
+                ? 'Audio leaves the mic as it is spoken over one WebSocket, and the turn is committed ~1.6 s after you stop — long enough to pause and finish a sentence. Needs an ElevenLabs transcription URL below; other endpoints fall back to the modes above.'
+                : ' Off — each finished turn is recorded and uploaded separately, which adds about a second before the reply starts.'}
             </p>
             {voice.interim && <p className="voice-card-note" style={{ color: 'var(--text)' }}>Partial: {voice.interim.slice(-120)}</p>}
           </section>

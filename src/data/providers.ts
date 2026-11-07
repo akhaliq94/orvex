@@ -88,8 +88,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.groq.com/openai/v1',
     api: 'openai',
     env: ['GROQ_API_KEY'],
-    models: ['llama-3.3-70b-versatile', 'whisper-large-v3-turbo'],
-    note: 'Very fast inference on open models.',
+    models: ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'allam-2-7b'],
+    note: 'Very fast inference on open models. Whisper is speech input only — pick it under Voice, not here.',
   },
   {
     id: 'mistral',
@@ -253,6 +253,8 @@ export type RemoteModelList = {
   models: RemoteModel[]
   /** true when the server returned pricing, so `free` is authoritative */
   priced: boolean
+  /** ids the endpoint listed that cannot answer a chat request (speech, classifiers) */
+  skipped?: string[]
 }
 
 function isZeroPrice(v: unknown): boolean {

@@ -240,3 +240,17 @@ export const HUMANITY_PROMPT = `
 - Use lists only when there are genuinely several parallel items. Otherwise write in sentences.
 - Never claim you did something you did not do. If a tool or backend is missing, say it plainly.
 `.trim()
+
+/**
+ * Spoken Urdu and Hindi share their sound inventory, so a multilingual
+ * transcriber regularly writes Urdu as Devanagari and the model then answers —
+ * and searches — in Hindi. These rules pin the conversation to Urdu while
+ * letting web search run in English, which returns far better results.
+ */
+export const LANGUAGE_PROMPT = `
+## Language
+- I speak Urdu. Reply in Urdu: Roman Urdu when I write in Roman letters, Urdu script when I speak. Never answer in Hindi.
+- If my message arrives in Devanagari, that is Urdu written in the wrong script by the transcriber — read it as Urdu and still answer in Urdu.
+- If my message stops mid-sentence, I was cut off. Ask one short line to finish it instead of guessing what I meant.
+- When you search the web, always write the query itself in English — web_search, browser search boxes, site searches — then explain the findings in Urdu.
+`.trim()

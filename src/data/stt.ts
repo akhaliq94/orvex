@@ -90,7 +90,7 @@ export function sttTarget(cfg: VoiceConfig): SttTarget | null {
   return { url, model: typed || (isElevenLabsHost(url) ? 'scribe_v2' : 'whisper-1') }
 }
 
-function isElevenLabsHost(url: string): boolean {
+export function isElevenLabsHost(url: string): boolean {
   try {
     return new URL(url).hostname.toLowerCase().endsWith('elevenlabs.io')
   } catch {
@@ -254,9 +254,10 @@ export function hasSpeech(text: string): boolean {
 export async function transcribeClip(
   target: SttTarget,
   audio: Blob,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; language?: string } = {},
 ): Promise<TranscribeOutcome> {
   const timeoutMs = opts.timeoutMs ?? (isLocalWhisper(target) ? 120000 : 45000)
+  const language = String(opts.language || '').trim()
   const desktop = typeof window !== 'undefined' ? window.orvex : undefined
   if (desktop?.stt) {
     try {
@@ -266,6 +267,7 @@ export async function transcribeClip(
         audio: await audio.arrayBuffer(),
         type: audio.type,
         timeoutMs: timeoutMs,
+        language: language || undefined,
       })
       if (!res.ok) return { ok: false, text: '', detail: `Transcription failed — ${res.error}` }
       const text = (res.data.text ?? '').trim()
@@ -281,6 +283,9 @@ export async function transcribeClip(
   const ext = audio.type.includes('wav') ? 'wav' : audio.type.includes('ogg') ? 'ogg' : 'webm'
   form.append('file', audio, `clip.${ext}`)
   form.append('model', target.model)
+  // Whisper-family engines take a bare ISO code; unsupported values are
+  // ignored by the server, and an empty hint leaves detection on.
+  if (language) form.append('language', language)
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -303,5 +308,116 @@ export async function transcribeClip(
     return { ok: false, text: '', detail: `Could not reach the transcription endpoint — ${msg}` }
   } finally {
     clearTimeout(timer)
+  }
+}
+
+/* ------------------------------------------------------------------ live input */
+
+export type RealtimeSession = { id: string; sampleRate: number; model: string; commitStrategy: string }
+
+export type RealtimeStart =
+  | { ok: true; session: RealtimeSession }
+  | { ok: false; detail: string }
+
+const realtimeBridge = () => (typeof window !== 'undefined' ? window.orvex?.stt?.realtime : undefined)
+
+export function realtimeSupported(): boolean {
+  return !!realtimeBridge()
+}
+
+/** Opens the live microphone session; the key stays in the main process. */
+export async function startRealtimeStt(opts: { silenceSecs?: number; language?: string } = {}): Promise<RealtimeStart> {
+  const bridge = realtimeBridge()
+  if (!bridge) return { ok: false, detail: 'Live speech input needs the desktop app.' }
+  try {
+    const res = await bridge.start({ silenceSecs: opts.silenceSecs, language: opts.language })
+    if (!res.ok) return { ok: false, detail: res.error }
+    return { ok: true, session: { id: res.data.id, sampleRate: res.data.sampleRate, model: res.data.model, commitStrategy: res.data.commitStrategy } }
+  } catch (e) {
+    return { ok: false, detail: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+export type RealtimeEvent = {
+  id: string
+  type: 'ready' | 'partial' | 'committed' | 'warning' | 'error' | 'closed'
+  text?: string
+  message?: string
+  error?: string
+}
+
+export function onRealtimeEvent(cb: (event: RealtimeEvent) => void): () => void {
+  const bridge = realtimeBridge()
+  if (!bridge) return () => {}
+  return bridge.onEvent(cb)
+}
+
+/** Base64 in slices, so a long chunk cannot blow the argument limit. */
+export function pcmToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const step = 0x8000
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step))
+  }
+  return btoa(binary)
+}
+
+export function floatToPcm16(input: Float32Array): Uint8Array {
+  const out = new Uint8Array(input.length * 2)
+  const view = new DataView(out.buffer)
+  for (let i = 0; i < input.length; i++) {
+    const v = Math.max(-1, Math.min(1, input[i]))
+    view.setInt16(i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true)
+  }
+  return out
+}
+
+/** Wraps collected PCM in a WAV header so the turn can be fingerprinted or replayed. */
+export function pcmChunksToWav(chunks: Uint8Array[], sampleRate: number): Blob {
+  const bytes = chunks.reduce((n, c) => n + c.length, 0)
+  const out = new Uint8Array(44 + bytes)
+  const view = new DataView(out.buffer)
+  const tag = (at: number, text: string) => {
+    for (let i = 0; i < text.length; i++) out[at + i] = text.charCodeAt(i)
+  }
+  tag(0, 'RIFF')
+  view.setUint32(4, 36 + bytes, true)
+  tag(8, 'WAVE')
+  tag(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  tag(36, 'data')
+  view.setUint32(40, bytes, true)
+  let at = 44
+  for (const chunk of chunks) {
+    out.set(chunk, at)
+    at += chunk.length
+  }
+  return new Blob([out], { type: 'audio/wav' })
+}
+
+export async function sendRealtimeAudio(id: string, pcm: Uint8Array, commit = false): Promise<boolean> {
+  const bridge = realtimeBridge()
+  if (!bridge) return false
+  try {
+    const res = await bridge.audio(id, pcmToBase64(pcm), commit)
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export async function stopRealtimeStt(id?: string): Promise<void> {
+  const bridge = realtimeBridge()
+  if (!bridge) return
+  try {
+    await bridge.stop(id)
+  } catch {
+    /* session already gone */
   }
 }

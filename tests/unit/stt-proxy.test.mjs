@@ -98,8 +98,39 @@ describe('speech input dialects', () => {
     expect(opts.body.get('model_id')).toBeNull()
   })
 
-  it('falls back to each family default only when no model was typed', async () => {
+  it('sends the language hint under each family\'s field name', async () => {
     const eleven = vi.fn().mockResolvedValue(ok('a'))
+    await proxy.transcribeAudio({
+      url: 'https://api.elevenlabs.io/v1/speech-to-text',
+      audio,
+      language: 'ur',
+      fetchImpl: eleven,
+    })
+    expect(eleven.mock.calls[0][1].body.get('language_code')).toBe('ur')
+    expect(eleven.mock.calls[0][1].body.get('language')).toBeNull()
+
+    const openai = vi.fn().mockResolvedValue(ok('a'))
+    await proxy.transcribeAudio({
+      url: 'https://api.groq.com/openai/v1/audio/transcriptions',
+      audio,
+      language: 'ur',
+      fetchImpl: openai,
+    })
+    expect(openai.mock.calls[0][1].body.get('language')).toBe('ur')
+    expect(openai.mock.calls[0][1].body.get('language_code')).toBeNull()
+
+    // No hint means auto-detect: neither field is sent.
+    const bare = vi.fn().mockResolvedValue(ok('a'))
+    await proxy.transcribeAudio({
+      url: 'https://api.openai.com/v1/audio/transcriptions',
+      audio,
+      language: '   ',
+      fetchImpl: bare,
+    })
+    expect(bare.mock.calls[0][1].body.get('language')).toBeNull()
+  })
+
+  it('falls back to each family default only when no model was typed', async () => {    const eleven = vi.fn().mockResolvedValue(ok('a'))
     await proxy.transcribeAudio({ url: 'https://api.elevenlabs.io/v1/speech-to-text', audio, fetchImpl: eleven })
     expect(eleven.mock.calls[0][1].body.get('model_id')).toBe('scribe_v2')
     expect(eleven.mock.calls[0][1].headers).toEqual({})

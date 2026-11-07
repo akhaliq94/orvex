@@ -207,3 +207,49 @@ describe('streamed chat with tools', () => {
     expect(out.text).toBe('ok')
   })
 })
+
+describe('tool budget', () => {
+  it('caps an oversized tool list at 128 and keeps the core tools', async () => {
+    const defs = Array.from({ length: 134 }, (_, i) => ({ name: i === 0 ? 'fs_read' : i === 1 ? 'shell_exec' : `tool_${i}`, description: 'x', parameters: { type: 'object' } }))
+    const sent = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init) => {
+        sent.push(JSON.parse(init.body))
+        return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+          headers: { 'content-type': 'application/json' },
+        })
+      }),
+    )
+    const out = await gateway.chat({
+      candidates: [openai],
+      history: [{ role: 'user', text: 'hi' }],
+      tools: defs,
+    })
+    const names = sent[0].tools.map((t) => t.function.name)
+    expect(names).toHaveLength(128)
+    expect(names).toContain('fs_read')
+    expect(names).toContain('shell_exec')
+    expect(out.text).toBe('ok')
+  })
+
+  it('leaves a small tool list untouched and removes duplicates', async () => {
+    const defs = [
+      { name: 'fs_read', description: 'x', parameters: { type: 'object' } },
+      { name: 'fs_read', description: 'x', parameters: { type: 'object' } },
+      { name: 'fs_write', description: 'x', parameters: { type: 'object' } },
+    ]
+    const sent = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init) => {
+        sent.push(JSON.parse(init.body))
+        return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+          headers: { 'content-type': 'application/json' },
+        })
+      }),
+    )
+    await gateway.chat({ candidates: [openai], history: [{ role: 'user', text: 'hi' }], tools: defs })
+    expect(sent[0].tools.map((t) => t.function.name)).toEqual(['fs_read', 'fs_write'])
+  })
+})

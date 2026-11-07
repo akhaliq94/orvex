@@ -9,6 +9,7 @@ export { forSpeech }
 export type VoiceEngineId =
   | 'browser'
   | 'heygen'
+  | 'elevenlabs'
   | 'omnivoice'
   | 'xtts'
   | 'fish'
@@ -43,6 +44,14 @@ export const VOICE_ENGINES: VoiceEngine[] = [
     name: 'HeyGen Voice Turbo',
     repo: 'heygen.com',
     note: 'Cloud voices. Add your HeyGen API key in Settings → Voice, then fetch the voice list. Clips land in the Media library.',
+    cloning: false,
+    streaming: true,
+  },
+  {
+    id: 'elevenlabs',
+    name: 'ElevenLabs Flash — live voice',
+    repo: 'elevenlabs.io',
+    note: 'Fastest spoken replies: audio starts while the sentence is still being generated. Uses the same ElevenLabs key (and backup keys) as speech input, so one list covers both.',
     cloning: false,
     streaming: true,
   },
@@ -146,6 +155,9 @@ export type VoiceConfig = {
   heygenModel: string
   heygenVoiceId: string
   heygenLanguage: string
+  /** ElevenLabs cloud engine settings — speech output, streamed as PCM frames */
+  elevenModel: string
+  elevenVoiceId: string
   /** OpenAI-compatible ASR endpoint path (VoiceStudio: POST /v1/audio/transcriptions) */
   asrPath: string
   /** full URL of an OpenAI-compatible transcription endpoint (overrides serverUrl + asrPath) */
@@ -166,6 +178,13 @@ export type VoiceConfig = {
   bargeInThreshold: number
   /** upload ~1s partials while a turn is still being spoken */
   streaming: boolean
+  /** stream the mic live (ElevenLabs realtime) instead of uploading whole turns */
+  realtimeStt: boolean
+  /**
+   * Spoken language hint for transcription, as an ISO code ('ur', 'hi', 'en', or
+   * '' for auto-detect). A hint keeps Urdu speech from coming back as Hindi.
+   */
+  sttLanguage: string
   /** fingerprint each finished turn and match it to an enrolled profile */
   speakerId: boolean
 }
@@ -185,6 +204,8 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
   heygenModel: 'heygen-voice-1-turbo-free',
   heygenVoiceId: '83548de556df48ba8c09c42a57c51d85',
   heygenLanguage: 'en',
+  elevenModel: 'eleven_flash_v2_5',
+  elevenVoiceId: '',
   asrPath: '/v1/audio/transcriptions',
   asrUrl: '',
   asrModel: 'whisper-1',
@@ -198,8 +219,22 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
   bargeIn: true,
   bargeInThreshold: 0.18,
   streaming: true,
+  realtimeStt: true,
+  sttLanguage: 'ur',
   speakerId: false,
 }
+
+/**
+ * Speech-to-text language hints. Without a hint a multilingual engine guesses,
+ * and Urdu and Hindi share most of their sound inventory, so short Urdu turns
+ * come back in Devanagari. The empty id leaves the engine to detect on its own.
+ */
+export const STT_LANGUAGES: { id: string; name: string }[] = [
+  { id: 'ur', name: 'Urdu' },
+  { id: 'hi', name: 'Hindi' },
+  { id: 'en', name: 'English' },
+  { id: '', name: 'Auto-detect' },
+]
 
 const STORAGE_KEY = 'orvex-voice-config'
 const SPEAK_ONCE_KEY = 'orvex-voice-speak-on'
@@ -303,6 +338,7 @@ export async function speak(text: string, cfg: VoiceConfig, onPlaybackStart?: ()
 
   if (cfg.engine === 'browser') return speakWithBrowser(clean, cfg, generation, onPlaybackStart)
   if (cfg.engine === 'heygen') return speakHeygen(clean, cfg, generation, onPlaybackStart)
+  if (cfg.engine === 'elevenlabs') return speakElevenlabs(clean, cfg, generation, onPlaybackStart)
 
   const base = cfg.serverUrl.replace(/\/+$/, '')
   const path = cfg.synthPath.startsWith('/') ? cfg.synthPath : `/${cfg.synthPath}`
@@ -369,6 +405,12 @@ type HeygenPlayer = {
   /** Starts one synthesis request; its audio plays in reply order. */
   request: (text: string) => HeygenSegment
   /** No more requests: resolves once everything already requested has played. */
+  close: () => Promise<SpeakResult>
+}
+
+/** What a reply needs from a streaming engine, whichever one is configured. */
+type ReplyPlayer = {
+  request: (text: string) => { settled: Promise<void> }
   close: () => Promise<SpeakResult>
 }
 
@@ -597,6 +639,276 @@ async function speakHeygen(text: string, cfg: VoiceConfig, generation: number, o
   return player.close()
 }
 
+type ElevenFrame = { audio: string; sampleRate: number }
+
+type ElevenSegment = {
+  id: string
+  /** Frames that arrived before this segment's turn to play. */
+  parts: ElevenFrame[]
+  ended: boolean
+  failure: string | null
+  summary: { model: string; duration: number } | null
+  /** Scheduled sources of this segment that have not finished sounding. */
+  active: number
+  settled: Promise<void>
+  close: () => void
+}
+
+/**
+ * Ordered ElevenLabs speech for one reply.
+ *
+ * Frames are raw PCM, so they are scheduled on one audio clock back to back
+ * instead of being played as separate clips: a 100 ms frame that arrives while
+ * the previous one is still sounding is heard immediately after it, with no gap
+ * and no re-decode. That is what keeps a streamed reply sounding like one voice.
+ */
+function createElevenPlayer(bridge: MediaBridge, cfg: VoiceConfig, generation: number, onPlaybackStart?: () => void): ReplyPlayer {
+  const segments: ElevenSegment[] = []
+  const detach = new Map<string, () => void>()
+  const sources = new Set<AudioBufferSourceNode>()
+  let ctx: AudioContext | null = null
+  let nextTime = 0
+  let cursor = 0
+  let closed = false
+  let heard = false
+  let result: SpeakResult | null = null
+  let failure: SpeakResult | null = null
+  let resolveClose = (_value: SpeakResult) => {}
+  const finished = new Promise<SpeakResult>((resolve) => {
+    resolveClose = resolve
+  })
+
+  const notify = () => {
+    if (heard || generation !== speechGeneration) return
+    heard = true
+    onPlaybackStart?.()
+  }
+
+  const stopAudio = () => {
+    for (const src of [...sources]) {
+      try {
+        src.stop()
+      } catch {
+        /* already finished */
+      }
+    }
+    sources.clear()
+    nextTime = 0
+    if (stopPlayback === stopAudio) stopPlayback = null
+  }
+
+  const silence = () => {
+    stopAudio()
+    const open = ctx
+    ctx = null
+    if (open) void open.close().catch(() => {})
+  }
+
+  const success = (): SpeakResult => {
+    const spoken = segments.find((s) => s.summary)
+    if (!spoken) return { ok: false, detail: 'ElevenLabs speech failed — no audio returned.' }
+    const seconds = segments.reduce((sum, s) => sum + (s.summary?.duration ?? 0), 0)
+    return { ok: true, detail: `Spoken via ElevenLabs ${spoken.summary!.model}${seconds ? ` · ${seconds.toFixed(1)}s` : ''}` }
+  }
+
+  const settle = (value: SpeakResult) => {
+    if (result) return
+    result = value
+    liveTracks.delete(cancel)
+    for (const segment of segments) segment.close()
+    silence()
+    resolveClose(value)
+  }
+
+  const cancel = () => settle(STOPPED)
+
+  const fail = (message: string) => {
+    failure = { ok: false, detail: `ElevenLabs speech failed — ${message}` }
+    settle(failure)
+  }
+
+  /** Puts one frame on the audio clock, after everything already scheduled. */
+  const schedule = (segment: ElevenSegment, frame: ElevenFrame) => {
+    let bytes: Uint8Array
+    try {
+      bytes = Uint8Array.from(atob(frame.audio), (c) => c.charCodeAt(0))
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e))
+      return
+    }
+    const samples = Math.floor(bytes.length / 2)
+    if (!samples) return
+    const rate = Number(frame.sampleRate) > 0 ? Number(frame.sampleRate) : 24000
+    if (!ctx) {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      ctx = new Ctor()
+      nextTime = 0
+    }
+    if (ctx.state === 'suspended') void ctx.resume().catch(() => {})
+    const view = new DataView(bytes.buffer, bytes.byteOffset, samples * 2)
+    const buffer = ctx.createBuffer(1, samples, rate)
+    const channel = buffer.getChannelData(0)
+    for (let i = 0; i < samples; i++) channel[i] = view.getInt16(i * 2, true) / 32768
+    const src = ctx.createBufferSource()
+    src.buffer = buffer
+    src.connect(ctx.destination)
+    // A hair of lead-in keeps the very first frame from being clipped by the
+    // clock, and every later frame lands exactly where the last one ended.
+    const start = Math.max(ctx.currentTime + 0.015, nextTime)
+    nextTime = start + buffer.duration
+    segment.active += 1
+    sources.add(src)
+    stopPlayback = stopAudio
+    src.onended = () => {
+      sources.delete(src)
+      segment.active -= 1
+      step()
+    }
+    try {
+      src.start(start)
+    } catch (e) {
+      sources.delete(src)
+      segment.active -= 1
+      fail(e instanceof Error ? e.message : String(e))
+      return
+    }
+    notify()
+  }
+
+  /** Plays the current segment's frames, then moves to the next finished one. */
+  const step = () => {
+    if (result) return
+    if (generation !== speechGeneration) {
+      settle(STOPPED)
+      return
+    }
+    for (;;) {
+      const segment = segments[cursor]
+      if (!segment) {
+        if (closed) settle(failure ?? success())
+        return
+      }
+      if (segment.failure) {
+        fail(segment.failure)
+        return
+      }
+      while (segment.parts.length && !result) schedule(segment, segment.parts.shift()!)
+      if (result) return
+      if (segment.ended && segment.active === 0) {
+        cursor += 1
+        continue
+      }
+      return
+    }
+  }
+
+  liveTracks.add(cancel)
+
+  return {
+    request(text: string) {
+      const id = crypto.randomUUID()
+      let resolveSettled = () => {}
+      const settled = new Promise<void>((resolve) => {
+        resolveSettled = resolve
+      })
+      const segment: ElevenSegment = {
+        id,
+        parts: [],
+        ended: false,
+        failure: null,
+        summary: null,
+        active: 0,
+        settled,
+        close: () => {
+          const off = detach.get(id)
+          detach.delete(id)
+          try {
+            off?.()
+          } catch {
+            /* listener already detached */
+          }
+          if (segment.ended && !segment.failure && !segment.parts.length && !segment.active) return
+          segment.ended = true
+          segment.parts.length = 0
+          resolveSettled()
+          try {
+            void bridge.stopElevenTts(id).catch(() => {})
+          } catch {
+            /* bridge closed */
+          }
+        },
+      }
+      segments.push(segment)
+      if (result) {
+        segment.close()
+        return segment
+      }
+
+      let lastIndex = -1
+      const off = bridge.onElevenAudio((event) => {
+        if (event.id !== id || segment.ended || generation !== speechGeneration) return
+        if (!Number.isSafeInteger(event.index) || event.index <= lastIndex) return
+        lastIndex = event.index
+        const frame = { audio: event.audio, sampleRate: event.sampleRate }
+        // A later sentence can arrive while this one is still sounding; its
+        // frames wait so the reply is heard in the order it was written.
+        if (segments[cursor] === segment) schedule(segment, frame)
+        else segment.parts.push(frame)
+        step()
+      })
+      detach.set(id, off)
+
+      const complete = (error: string | null, summary: { model: string; duration: number } | null) => {
+        if (segment.ended) return
+        segment.failure = error
+        segment.summary = summary
+        if (error) segment.parts.length = 0
+        segment.ended = true
+        resolveSettled()
+        step()
+      }
+
+      try {
+        void bridge
+          .elevenTtsStream({
+            id,
+            text,
+            voiceId: cfg.elevenVoiceId.trim(),
+            model: cfg.elevenModel,
+            speed: cfg.speed,
+          })
+          .then(
+            (res) => {
+              if (!res.ok) return complete(res.error, null)
+              complete(lastIndex < 0 ? 'ElevenLabs returned no audio.' : null, { model: res.data.model, duration: res.data.duration })
+            },
+            (error: unknown) => complete(error instanceof Error ? error.message : String(error), null),
+          )
+      } catch (e) {
+        complete(e instanceof Error ? e.message : String(e), null)
+      }
+      return segment
+    },
+
+    close() {
+      closed = true
+      step()
+      return finished
+    },
+  }
+}
+
+async function speakElevenlabs(text: string, cfg: VoiceConfig, generation: number, onPlaybackStart?: () => void): Promise<SpeakResult> {
+  const bridge = desktopMedia()
+  if (!bridge?.elevenTtsStream || !bridge.onElevenAudio || !bridge.stopElevenTts) {
+    return { ok: false, detail: 'ElevenLabs voice needs the desktop app.' }
+  }
+  if (!cfg.elevenVoiceId.trim()) return { ok: false, detail: 'Pick an ElevenLabs voice in Settings → Voice, then fetch the voice list.' }
+  const player = createElevenPlayer(bridge, cfg, generation, onPlaybackStart)
+  player.request(text)
+  return player.close()
+}
+
 export type ReplySpeech = {
   /** Feed the reply as it grows; finished sentences start being spoken now. */
   push: (textSoFar: string) => void
@@ -610,8 +922,10 @@ export type ReplySpeech = {
  * writing; every other engine speaks the completed reply in one go.
  */
 export function beginReplySpeech(cfg: VoiceConfig, onPlaybackStart?: () => void): ReplySpeech {
-  const bridge = cfg.engine === 'heygen' ? desktopMedia() : undefined
-  const streaming = !!bridge && !!cfg.heygenVoiceId.trim()
+  const eleven = cfg.engine === 'elevenlabs'
+  const bridge = eleven || cfg.engine === 'heygen' ? desktopMedia() : undefined
+  const voiceId = eleven ? cfg.elevenVoiceId : cfg.heygenVoiceId
+  const streaming = !!bridge && !!voiceId.trim()
   const sentences: string[] = []
   let raw = ''
   let consumed = 0
@@ -621,7 +935,7 @@ export function beginReplySpeech(cfg: VoiceConfig, onPlaybackStart?: () => void)
   let requested = 0
   let live = 0
   let closed = false
-  let player: HeygenPlayer | null = null
+  let player: ReplyPlayer | null = null
 
   const requestMore = () => {
     if (!player) return
@@ -652,7 +966,9 @@ export function beginReplySpeech(cfg: VoiceConfig, onPlaybackStart?: () => void)
       if (!player) {
         // This reply supersedes anything still talking from an earlier turn.
         stopSpeaking()
-        player = createHeygenPlayer(bridge!, cfg, speechGeneration, onPlaybackStart)
+        player = eleven
+          ? createElevenPlayer(bridge!, cfg, speechGeneration, onPlaybackStart)
+          : createHeygenPlayer(bridge!, cfg, speechGeneration, onPlaybackStart)
       }
       requestMore()
     },

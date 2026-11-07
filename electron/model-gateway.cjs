@@ -142,8 +142,38 @@ function toAnthropicMessages(history, opts = {}) {
   return out;
 }
 
+/**
+ * OpenAI-compatible endpoints accept at most 128 tool definitions (Groq answers
+ * "'tools' : maximum number of items is 128"). ORVEX registers more tools than
+ * that, so a request carries a capped list instead of failing outright. The
+ * tools an agent reaches for on almost every run are kept first; the rest fill
+ * the remaining room in registry order.
+ */
+const MAX_TOOL_DEFINITIONS = 128;
+
+const CORE_TOOLS = new Set([
+  'fs_read', 'fs_write', 'fs_list', 'fs_find', 'shell_exec', 'python_run', 'app_open', 'app_launch',
+  'web_search', 'web_fetch', 'http_request',
+  'browser_open', 'browser_snapshot', 'browser_task', 'browser_click', 'browser_type', 'browser_press', 'browser_text', 'browser_scroll',
+  'screen_capture', 'screen_find', 'screen_click_text', 'ui_tree', 'ui_action', 'ui_wait',
+  'mouse_move', 'mouse_click', 'mouse_scroll', 'mouse_drag', 'key_type', 'key_press', 'wait',
+  'window_list', 'window_action', 'clipboard_read', 'clipboard_write', 'system_status',
+  'todo_add', 'todo_complete', 'todo_list', 'memory_append', 'memory_search', 'skill_load', 'skill_list',
+]);
+
+/** Dedupe and cap a tool list to what the provider accepts. */
+function fitTools(defs) {
+  const list = Array.isArray(defs) ? defs.filter((d) => d && d.name) : [];
+  const seen = new Set();
+  const unique = list.filter((d) => (seen.has(d.name) ? false : (seen.add(d.name), true)));
+  if (unique.length <= MAX_TOOL_DEFINITIONS) return unique;
+  const core = unique.filter((d) => CORE_TOOLS.has(d.name));
+  const rest = unique.filter((d) => !CORE_TOOLS.has(d.name));
+  return [...core, ...rest.slice(0, Math.max(0, MAX_TOOL_DEFINITIONS - core.length))];
+}
+
 function openAITools(defs) {
-  return (defs || []).map((d) => ({
+  return fitTools(defs).map((d) => ({
     type: 'function',
     function: { name: d.name, description: d.description, parameters: d.parameters },
   }));
@@ -222,9 +252,9 @@ function parseRetryAfter(res) {
   const raw = res.headers.get('retry-after');
   if (!raw) return 0;
   const secs = Number(raw);
-  if (Number.isFinite(secs)) return Math.min(Math.max(secs * 1000, 0), 15000);
+  if (Number.isFinite(secs)) return Math.min(Math.max(secs * 1000, 0), 60000);
   const at = Date.parse(raw);
-  return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), 15000) : 0;
+  return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), 60000) : 0;
 }
 
 function sleep(ms, signal) {
@@ -250,7 +280,7 @@ function friendly(status, text) {
   if (status === 401 || status === 403) return `the API key was rejected (${status}) — check this provider's key in Settings`;
   if (status === 402) return 'the account is out of credits (402) — top up or switch provider';
   if (status === 404) return `model not found (404) — the provider does not serve this model id`;
-  if (status === 429) return 'rate-limited upstream (429) — retrying, then failing over to the next model';
+  if (status === 429) return 'rate-limited upstream (429) — retried with backoff';
   if (status === 503) return 'the provider has no healthy upstream right now (503)';
   if (status >= 500) return `provider error ${status}`;
   if (status === 400) return `the provider rejected the request (400) — ${detail.slice(0, 160)}`;
@@ -806,7 +836,7 @@ async function chat(opts) {
 
         if (retryable && attemptNo < MAX_ATTEMPTS) {
           const waitMs = (err && err.retryAfter) || Math.min(600 * 2 ** (attemptNo - 1) + Math.round(Math.random() * 250), 4000);
-          opts.onEvent?.({ type: 'model_retry', provider: candidate.name, model: candidate.model, attempt: attemptNo, waitMs, reason: message });
+          opts.onEvent?.({ type: 'model_retry', provider: candidate.name, model: candidate.model, attempt: attemptNo, maxAttempts: MAX_ATTEMPTS, waitMs, status: err && err.status, reason: message });
           try {
             await sleep(waitMs, opts.signal);
           } catch {
@@ -865,6 +895,7 @@ module.exports = {
   isLocal,
   setRouteObserver,
   ModelError,
+  parseRetryAfter,
   MAX_ATTEMPTS,
   BREAKER_OPEN_MS,
 };

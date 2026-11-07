@@ -273,7 +273,8 @@ async function makePlan({ query, depth, cfg, candidates, gateway, signal }) {
         task: 'research',
         system:
           'You plan web research. Break the question into distinct sub-questions and write short, keyword-rich search queries ' +
-          '(no site: operators, no quotes unless essential). Reply with JSON only.',
+          '(no site: operators, no quotes unless essential). Always write the queries in English, even when the question ' +
+          'is in Urdu, Hindi or another language — the search backends index English far better. Reply with JSON only.',
         history: [
           {
             role: 'user',
@@ -585,7 +586,8 @@ async function followUpQueries({ query, sources, candidates, gateway, signal }) 
     task: 'research',
     system:
       'You find gaps in research coverage. Given the question and the sources already read, reply with JSON only: ' +
-      '2-3 new search queries that would fill the most important gaps. No site: operators.',
+      '2-3 new search queries that would fill the most important gaps. Write them in English whatever the question\'s ' +
+      'language. No site: operators.',
     history: [{ role: 'user', text: `Question: ${query}\n\nSources already read:\n${snippets}` }],
     maxTokens: 300,
     temperature: 0.3,

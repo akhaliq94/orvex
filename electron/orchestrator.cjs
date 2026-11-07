@@ -279,7 +279,15 @@ async function runOrchestrator(opts) {
   const gateEvent = (event) => {
     if (!event) return;
     if (event.type === 'model_retry') {
-      emit({ type: 'status', text: `Planner/validator hit a temporary error — retrying (${event.attempt || 1}/${event.maxAttempts || 2})` });
+      const wait = Math.round(Number(event.waitMs || 0) / 1000);
+      const when = wait >= 1 ? `waiting ${wait}s, ` : '';
+      const rateLimited = Number(event.status) === 429 || /429|rate.?limit/i.test(String(event.reason || ''));
+      emit({
+        type: 'status',
+        text: rateLimited
+          ? `Planner/validator is rate-limited — ${when}retry ${event.attempt || 1}/${event.maxAttempts || 2}`
+          : `Planner/validator hit a temporary error — ${when}retry ${event.attempt || 1}/${event.maxAttempts || 2}`,
+      });
     } else if (event.type === 'model_fallback') {
       emit({ type: 'status', text: `Failing over to ${event.next || 'the next model'}` });
     } else if (event.type === 'budget_exceeded') {

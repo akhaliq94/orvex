@@ -40,6 +40,7 @@ Rules:
 - screen_record_start / screen_record_stop make a real .webm video of a display; always stop the recording when the task is done.
 - Screenshots from screen_capture and browser_screenshot are attached to your next message as real images. Look at the picture before clicking; never invent what is on screen.
 - When a goal needs current information (news, prices, docs, versions), use web_search and then web_fetch the most relevant result. Do not answer from memory when the answer may have changed.
+- Write every web_search query, browser search box and site search in English, even when the goal is in Urdu or Hindi — search engines return far better results in English. Answer the user in Urdu unless they wrote in English.
 - When a tool fails, read the error and try a different approach once, then explain the blocker.
 - Delegate independent research or checking to a background sub-agent with delegate_start when you can keep working in parallel; call delegate_wait before you finish. Sub-agents cannot ask the user for approval, so they never perform risky actions.
 - Sub-agent work is durable: delegate_queue lists earlier tasks, and delegate_resume re-runs one that was interrupted by a restart or failed. Resume only when the user wants that work completed.
@@ -192,7 +193,36 @@ async function compactHistory(chain, localCfg, history, signal, emit) {
   }
 }
 
-async function runAgent({ goal, provider, candidates, local, memory, emit, signal, gate, approve, maxSteps, autoApprove, runId, task, systemAppend, unattended = false, allowDelegation = true }) {
+/**
+ * Small providers meter tokens per minute, and 134 tool schemas are ~15k tokens
+ * before the prompt is even added — Groq's free tier answers 413 instead of
+ * running. This lean set covers talking, searching, browsing, files, the screen
+ * and memory in about a fifth of the space, so a rate-limited model can still
+ * hold a conversation and act.
+ */
+const LEAN_TOOL_NAMES = [
+  'web_search', 'web_fetch', 'http_request', 'browser_task', 'browser_open', 'browser_snapshot',
+  'browser_click', 'browser_type', 'browser_press', 'app_open', 'fs_read', 'fs_write', 'fs_list',
+  'shell_exec', 'screen_capture', 'key_type', 'mouse_click', 'clipboard_read', 'clipboard_write',
+  'memory_search', 'memory_append', 'todo_add', 'todo_list', 'system_status', 'wait',
+];
+function leanTools(all) {
+  const wanted = new Set(LEAN_TOOL_NAMES);
+  const picked = all.filter((d) => d && wanted.has(d.name));
+  return picked.length ? picked : all;
+}
+function tooLarge(message) {
+  return /413|request too large|payload too large|context length|maximum context|tokens per min/i.test(String(message || ''));
+}
+
+/**
+ * Providers that already answered 413 with the full tool list. Retrying them
+ * with all 134 schemas on every turn wastes a request and dumps an error into
+ * the status line, so the rest of this app session starts lean for them.
+ */
+const leanProviders = new Set();
+
+async function runAgent({ goal, provider, candidates, local, memory, emit, signal, gate, approve, maxSteps, autoApprove, runId, task, systemAppend, unattended = false, allowDelegation = true, compactTools = false }) {
   const started = Date.now();
   const stepLimit = Math.min(Math.max(Number(maxSteps) || MAX_STEPS, 1), 200);
   const chain = candidatesFor(provider, candidates);
@@ -253,6 +283,13 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
 
   const history = [{ role: 'user', text: String(goal) }];
   let attachImages = true;
+  // Voice turns ask for a lean set up front: a spoken question rarely needs the
+  // maker or training tools, and the reply should not wait on a 413 round trip.
+  const lean = leanTools(definitions);
+  const providerKey = `${primary.baseUrl || ''}|${primary.model || ''}`;
+  const startLean = compactTools || leanProviders.has(providerKey);
+  let toolList = startLean ? lean : definitions;
+  let shrankTools = startLean || lean.length >= definitions.length;
 
   for (let step = 1; step <= stepLimit; step += 1) {
     steps = step;
@@ -285,7 +322,7 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
         reply = await callModel(chain, {
           system: `${system}\n\n${planPrompt()}`,
           history,
-          tools: definitions,
+          tools: toolList,
           signal,
           noImages: !attachImages,
           runId,
@@ -302,7 +339,16 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
           onEvent: (e) => {
             if (!e) return;
             if (e.type === 'model_retry') {
-              emit({ type: 'status', text: `${e.provider || primary.name || primary.model} hit a temporary error — retrying (${e.attempt || 1}/${e.maxAttempts || 2})` });
+              const who = e.provider || primary.name || primary.model;
+              const wait = Math.round(Number(e.waitMs || 0) / 1000);
+              const when = wait >= 1 ? `waiting ${wait}s, ` : '';
+              const rateLimited = Number(e.status) === 429 || /429|rate.?limit/i.test(String(e.reason || ''));
+              emit({
+                type: 'status',
+                text: rateLimited
+                  ? `${who} is rate-limited — ${when}retry ${e.attempt || 1}/${e.maxAttempts || 2}`
+                  : `${who} hit a temporary error — ${when}retry ${e.attempt || 1}/${e.maxAttempts || 2}`,
+              });
             } else if (e.type === 'model_fallback') {
               emit({ type: 'status', text: `Failing over to ${e.next || 'the next model'}` });
             } else if (e.type === 'model_error') {
@@ -332,6 +378,19 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
           attachImages = false;
           retriedWithoutImages = true;
           emit({ type: 'status', text: 'This model cannot read images — continuing without screenshots.' });
+          continue;
+        }
+        // A token-metered provider refuses the whole request when the tool
+        // schemas do not fit. Retrying with the lean set keeps the turn alive
+        // instead of failing the user's question over unused abilities.
+        if (!shrankTools && tooLarge(message)) {
+          shrankTools = true;
+          toolList = lean;
+          leanProviders.add(providerKey);
+          emit({
+            type: 'status',
+            text: `${primary.name || primary.model} could not fit the full tool list — continuing with the ${toolList.length} essential tools.`,
+          });
           continue;
         }
         audit({ kind: 'agent_error', error: message.slice(0, 500), steps });
@@ -487,4 +546,4 @@ async function runAgent({ goal, provider, candidates, local, memory, emit, signa
   return finish({ ok: false, summary: `Step limit (${stepLimit}) reached — goal not confirmed complete.` });
 }
 
-module.exports = { runAgent, MAX_STEPS, MAX_RUN_MS };
+module.exports = { runAgent, MAX_STEPS, MAX_RUN_MS, leanTools, tooLarge, LEAN_TOOL_NAMES };

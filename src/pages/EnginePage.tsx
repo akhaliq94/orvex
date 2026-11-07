@@ -301,7 +301,10 @@ export default function EnginePage({ onBack, notify, voice }: Props) {
       freeModels: free,
       model: ids.includes(active.model) ? active.model : ids[0] ?? active.model,
     })
-    notify(`${active.name}: ${ids.length} models imported${free.length ? ` · ${free.length} free` : ''}`)
+    const skipped = remote.skipped?.length ?? 0
+    notify(
+      `${active.name}: ${ids.length} chat models imported${free.length ? ` · ${free.length} free` : ''}${skipped ? ` · ${skipped} speech/classifier skipped` : ''}`,
+    )
   }
 
   const scrollRef = useRef<HTMLDivElement>(null)

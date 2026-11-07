@@ -388,7 +388,7 @@ const definitions = [
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query' },
+        query: { type: 'string', description: 'Search query, written in English even when the user speaks another language' },
         max: { type: 'number', description: 'How many results, 1-10 (default 6)' },
       },
       required: ['query'],

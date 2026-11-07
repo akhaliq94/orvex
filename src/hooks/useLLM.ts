@@ -127,6 +127,11 @@ export function useLLM() {
         const started = await bridge.llm.start({
           requestId,
           provider: {
+            // The identity is what lets the main process attach the stored key:
+            // without it every turn is sent unauthenticated, refused with 401 and
+            // only answered by the fallback copy of the same provider.
+            id: provider.id,
+            presetId: provider.presetId,
             name: provider.name,
             baseUrl: provider.baseUrl,
             apiKey: provider.apiKey,

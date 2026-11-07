@@ -73,7 +73,7 @@ async function postAudio(endpoint, { headers, form, timeoutMs, fetchImpl }) {
  * Node resolves `localhost` to ::1 first, so a server bound to 127.0.0.1 is
  * retried on the IPv4 address before the failure is reported.
  */
-async function transcribeAudio({ url, key, audio, type, model, timeoutMs, fetchImpl = fetch } = {}) {
+async function transcribeAudio({ url, key, audio, type, model, language, timeoutMs, fetchImpl = fetch } = {}) {
   let parsed;
   try {
     parsed = new URL(String(url || '').trim());
@@ -103,6 +103,14 @@ async function transcribeAudio({ url, key, audio, type, model, timeoutMs, fetchI
   // user chose is otherwise sent untouched.
   if (profile === 'elevenlabs') form.append('model_id', wanted || 'scribe_v2');
   else form.append('model', wanted || 'whisper-1');
+  // A language hint is what stops multilingual Scribe from writing Urdu speech
+  // in Devanagari. ElevenLabs names the field `language_code`; the
+  // OpenAI-compatible hosts use `language`.
+  const hint = String(language || '').trim().slice(0, 12);
+  if (hint) {
+    if (profile === 'elevenlabs') form.append('language_code', hint);
+    else form.append('language', hint);
+  }
   const headers = key
     ? profile === 'elevenlabs'
       ? { 'xi-api-key': String(key) }

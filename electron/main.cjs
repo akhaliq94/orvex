@@ -39,6 +39,9 @@ const memoryStore = require('./memory.cjs');
 const filesStore = require('./files.cjs');
 const creative = require('./creative.cjs');
 const sttProxy = require('./stt-proxy.cjs');
+const modelCatalog = require('./model-catalog.cjs');
+const elevenTts = require('./eleven-tts.cjs');
+const elevenRealtime = require('./eleven-realtime.cjs');
 const guardrails = require('./guardrails.cjs');
 const vault = require('./vault.cjs');
 const permissions = require('./permissions.cjs');
@@ -1138,6 +1141,8 @@ const llmStreams = new Map();
 const speechStreams = new Map();
 const SPEECH_STREAMS_PER_WINDOW = 4;
 const speechKey = (senderId, id) => `${senderId}:${id}`;
+/** One live microphone session per window; the socket and its key stay here. */
+const realtimeSessions = new Map();
 
 function uniqueCandidates(list) {
   const out = [];
@@ -1374,6 +1379,67 @@ async function sttKeyAttempts(target) {
   return out;
 }
 
+/**
+ * ElevenLabs keys for speech output. Speech input may point somewhere else
+ * entirely, so the single STT key only counts when it was saved for this host;
+ * the per-endpoint pool is the list the user built for ElevenLabs.
+ */
+async function elevenKeyAttempts() {
+  const origin = elevenTts.ORIGIN;
+  const out = [];
+  const seen = new Set();
+  const bindings = providerBindings();
+  for (const id of ['stt', 'elevenlabs']) {
+    const bound = bindings[id];
+    if (!bound || originOf(bound) !== origin) continue;
+    const key = vault.peek(id);
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      out.push({ id, key });
+    }
+  }
+  const pool = await readSttPool(origin);
+  for (const pick of sttKeys.pickOrder(pool, sttPoolHealth())) {
+    const entry = pool.find((row) => row.id === pick.id);
+    if (!entry || !entry.key || seen.has(entry.key)) continue;
+    seen.add(entry.key);
+    out.push({ id: entry.id, key: entry.key });
+  }
+  return out;
+}
+
+/** Runs one ElevenLabs call, moving to the next saved key when one is refused. */
+async function withElevenKey(run) {
+  const net = security.networkPolicyBlock(elevenTts.ORIGIN);
+  if (net) throw new Error(net);
+  const attempts = await elevenKeyAttempts();
+  if (!attempts.length) {
+    throw new Error('No ElevenLabs key is saved for speech output. Add one in Settings → Voice — the same key list serves speech input and output.');
+  }
+  if (attempts.length === 1) return run(attempts[0].key);
+  let health = sttPoolHealth();
+  let lastError = null;
+  let moved = false;
+  const refused = [];
+  for (const attempt of attempts) {
+    try {
+      const answer = await run(attempt.key);
+      if (moved) db.setSetting(STT_POOL_HEALTH_SETTING, sttKeys.withSuccess(health, attempt.id));
+      return answer;
+    } catch (err) {
+      const kind = sttKeys.classifyError(err);
+      if (!sttKeys.shouldRotate(kind)) throw err;
+      refused.push(attempt.id);
+      lastError = err;
+      moved = true;
+      health = sttKeys.withFailure(health, attempt.id, kind, Date.now(), err && err.message ? err.message : String(err));
+    }
+  }
+  db.setSetting(STT_POOL_HEALTH_SETTING, health);
+  const detail = lastError && lastError.message ? ` Last answer: ${lastError.message}` : '';
+  throw new Error(`All ${refused.length} saved ElevenLabs keys were refused.${detail}`);
+}
+
 function withMediaKey(payload, id) {
   const p = payload && typeof payload === 'object' ? payload : {};
   if (!p.url || p.key) return p;
@@ -1391,7 +1457,6 @@ function configuredChain(payload = {}) {
     fallback,
     ...(Array.isArray(payload.candidates) ? payload.candidates : []),
     payload.local,
-    ...(!localFirst && local ? [local] : []),
   ]);
   const planned = advanced.filterCandidates(base, {
     task: String(payload.task || 'agent'),
@@ -1420,7 +1485,6 @@ function unavailableModelMessage(payload = {}) {
     const route = localBrain.route({ task: String(payload.task || 'agent') });
     if (route.target === 'blocked') return route.reason;
     const base = uniqueCandidates([
-      localBrain.candidate(),
       payload.provider,
       ...(Array.isArray(payload.candidates) ? payload.candidates : []),
       payload.local,
@@ -1812,7 +1876,10 @@ async function startEngine(payload = {}, mode = 'agent', extra = {}) {
     } catch {
       /* first run — no legacy notes yet */
     }
-    memory = memory.slice(-8000);
+    const compact = payload.compactTools === true;
+    // A spoken turn keeps the prompt small: a token-metered provider rejects the
+    // whole request rather than trimming it, and the reply is what matters.
+    memory = memory.slice(-(compact ? 2400 : 8000));
     const shared = {
       goal,
       provider: payload.provider,
@@ -1827,18 +1894,23 @@ async function startEngine(payload = {}, mode = 'agent', extra = {}) {
       autoApprove: payload.autoApprove === true && security.status().role === 'owner',
       runId,
       task: payload.task || 'agent',
+      // Voice turns carry a lean tool set: a spoken question does not need the
+      // maker or training tools, and a small per-minute budget rejects them.
+      compactTools: compact,
     };
     const blocks = [];
     if (payload.systemAppend) blocks.push(String(payload.systemAppend).trim());
-    try {
-      const catalog = learner.skillCatalog(12);
-      if (catalog.length) {
-        blocks.push(
-          `Enabled skills from earlier successful runs. Each line is one skill — call skill_load with its id to get the full steps before applying one:\n${catalog.join('\n')}`,
-        );
+    if (!compact) {
+      try {
+        const catalog = learner.skillCatalog(12);
+        if (catalog.length) {
+          blocks.push(
+            `Enabled skills from earlier successful runs. Each line is one skill — call skill_load with its id to get the full steps before applying one:\n${catalog.join('\n')}`,
+          );
+        }
+      } catch {
+        /* skills are an optimisation, never a reason to block a run */
       }
-    } catch {
-      /* skills are an optimisation, never a reason to block a run */
     }
     if (blocks.filter(Boolean).length) shared.systemAppend = blocks.filter(Boolean).join('\n\n');
     if (mode === 'orchestrator') await runOrchestrator({ ...shared, resume });
@@ -1882,7 +1954,7 @@ async function runWorkforceShift({ agent, goal, systemAppend, onRunId }) {
   if (!provider || !provider.baseUrl || !provider.model) {
     throw new Error('Assign a cloud model to this agent, or start the Local Brain with a chat model loaded.');
   }
-  const candidates = uniqueCandidates([provider, local].filter(Boolean));
+  const candidates = uniqueCandidates([provider]);
   let finish = null;
   const finished = new Promise((resolve) => {
     finish = resolve;
@@ -2504,10 +2576,18 @@ function registerIpc() {
     const data = await res.json().catch(() => null);
     const rows = Array.isArray(data && data.data) ? data.data : Array.isArray(data && data.models) ? data.models : [];
     const models = [];
+    const skipped = [];
     let priced = false;
     for (const row of rows) {
       const id = row && typeof row.id === 'string' ? row.id : '';
       if (!id) continue;
+      // Speech, classifier and image endpoints live in the same /models list as
+      // chat models (Groq lists whisper and prompt-guard there too). They cannot
+      // answer a chat completion, so they stay out of the model dropdown.
+      if (modelCatalog.nonChatModel(id)) {
+        skipped.push(id);
+        continue;
+      }
       let free = /:free$/i.test(id);
       const pricing = row.pricing;
       if (pricing && typeof pricing === 'object') {
@@ -2521,7 +2601,7 @@ function registerIpc() {
       }
       models.push({ id, free });
     }
-    return models.length ? { models, priced } : null;
+    return models.length ? { models, priced, skipped } : null;
   });
 
   handle('orvex:providers:test', async (payload = {}) => {
@@ -2996,14 +3076,76 @@ function registerIpc() {
     return ok({ stopped: true });
   });
 
+  /* ElevenLabs speech output: the same stream registry, PCM frames instead of WAV parts. */
+  handle('orvex:media:elevenTtsStream', async (payload = {}, event) => {
+    const sender = event.sender;
+    if (![win, mini].some((w) => w && !w.isDestroyed() && w.webContents === sender)) throw new Error('Unknown speech client.');
+    const id = String(payload.id || '');
+    if (!/^[a-zA-Z0-9-]{1,80}$/.test(id)) throw new Error('Invalid speech request id.');
+    const key = speechKey(sender.id, id);
+    const previous = speechStreams.get(key);
+    if (previous) {
+      previous.controller.abort();
+      speechStreams.delete(key);
+    }
+    const live = [];
+    for (const [k, entry] of speechStreams) if (entry.senderId === sender.id) live.push(k);
+    while (live.length >= SPEECH_STREAMS_PER_WINDOW) {
+      const oldest = live.shift();
+      speechStreams.get(oldest).controller.abort();
+      speechStreams.delete(oldest);
+    }
+    const controller = new AbortController();
+    const entry = { id, senderId: sender.id, controller };
+    speechStreams.set(key, entry);
+    const abort = () => controller.abort();
+    sender.once('destroyed', abort);
+    sender.once('render-process-gone', abort);
+    sender.once('did-start-navigation', abort);
+    try {
+      return await withElevenKey((apiKey) =>
+        elevenTts.speakStream({
+          text: payload.text,
+          voiceId: payload.voiceId,
+          model: payload.model,
+          speed: payload.speed,
+          stability: payload.stability,
+          key: apiKey,
+          signal: controller.signal,
+          onAudio: (part) => {
+            const blocked = security.channelBlocked('orvex:media:elevenTtsStream') || security.networkPolicyBlock(elevenTts.ORIGIN);
+            if (blocked) {
+              controller.abort();
+              throw new Error(blocked);
+            }
+            if (!controller.signal.aborted && !sender.isDestroyed()) sender.send('orvex:media:elevenAudio', { id, ...part });
+          },
+        }),
+      );
+    } finally {
+      sender.removeListener('destroyed', abort);
+      sender.removeListener('render-process-gone', abort);
+      sender.removeListener('did-start-navigation', abort);
+      if (speechStreams.get(key) === entry) speechStreams.delete(key);
+    }
+  });
+  ipcMain.handle('orvex:media:stopElevenTts', (event, { id } = {}) => {
+    const entry = speechStreams.get(speechKey(event.sender.id, String(id || '')));
+    if (!entry) return ok({ stopped: false });
+    entry.controller.abort();
+    return ok({ stopped: true });
+  });
+  handle('orvex:media:elevenVoices', () => withElevenKey((key) => elevenTts.listVoices({ key })));
+  handle('orvex:media:elevenModels', () => withElevenKey((key) => elevenTts.listModels({ key })));
+
   /* Speech-to-text proxy: audio plus a stored key never meet in the renderer. */
-  handle('orvex:stt:transcribe', async ({ url, model, audio, type, timeoutMs } = {}) => {
+  handle('orvex:stt:transcribe', async ({ url, model, audio, type, timeoutMs, language } = {}) => {
     const target = String(url || '').trim();
     const net = security.networkPolicyBlock(target);
     if (net) throw new Error(net);
     const attempts = await sttKeyAttempts(target);
     if (attempts.length <= 1) {
-      return sttProxy.transcribeAudio({ url: target, key: attempts.length ? attempts[0].key : '', audio, type, model, timeoutMs });
+      return sttProxy.transcribeAudio({ url: target, key: attempts.length ? attempts[0].key : '', audio, type, model, language, timeoutMs });
     }
     let health = sttPoolHealth();
     let lastError = null;
@@ -3011,7 +3153,7 @@ function registerIpc() {
     const refused = [];
     for (const attempt of attempts) {
       try {
-        const answer = await sttProxy.transcribeAudio({ url: target, key: attempt.key, audio, type, model, timeoutMs });
+        const answer = await sttProxy.transcribeAudio({ url: target, key: attempt.key, audio, type, model, language, timeoutMs });
         // the keys that refused this clip stay parked, or the next turn walks
         // through a dead quota all over again
         if (moved) db.setSetting(STT_POOL_HEALTH_SETTING, sttKeys.withSuccess(health, attempt.id));
@@ -3041,6 +3183,120 @@ function registerIpc() {
     return { local: syncLocalWhisper() };
   });
   handle('orvex:stt:useProviderKey', async ({ url } = {}) => linkSttKeyFromProvider(String(url || '').trim()));
+
+  /* Live speech input: the mic is streamed, the service decides when a turn ends. */
+  handle('orvex:stt:realtime:start', async (payload = {}, event) => {
+    const sender = event.sender;
+    if (![win, mini].some((w) => w && !w.isDestroyed() && w.webContents === sender)) throw new Error('Unknown speech client.');
+    const net = security.networkPolicyBlock(elevenTts.ORIGIN);
+    if (net) throw new Error(net);
+    const old = realtimeSessions.get(sender.id);
+    if (old) {
+      clearInterval(old.keepAlive);
+      old.controller.abort();
+      old.session.close();
+      realtimeSessions.delete(sender.id);
+    }
+    const attempts = await elevenKeyAttempts();
+    if (!attempts.length) {
+      throw new Error('No ElevenLabs key is saved for live speech input. Add one in Settings → Voice.');
+    }
+    const id = `rt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    let health = sttPoolHealth();
+    let lastError = null;
+    let moved = false;
+    const refused = [];
+    for (const attempt of attempts) {
+      const controller = new AbortController();
+      let session = null;
+      try {
+        session = elevenRealtime.openSession({
+          key: attempt.key,
+          origin: elevenTts.ORIGIN,
+          model: payload.model,
+          language: payload.language,
+          commitStrategy: 'vad',
+          silenceSecs: payload.silenceSecs,
+          signal: controller.signal,
+          onEvent: (evt) => {
+            if (evt.type === 'error' && elevenRealtime.isKeyRefusal(evt.error)) {
+              // A credential that dies mid-conversation is parked like any other
+              const next = sttKeys.withFailure(sttPoolHealth(), attempt.id, sttKeys.classifyError({ status: evt.error === 'auth_error' ? 401 : evt.error === 'quota_exceeded' ? 402 : 429 }), Date.now(), evt.message);
+              db.setSetting(STT_POOL_HEALTH_SETTING, next);
+            }
+            const blocked = security.channelBlocked('orvex:stt:realtime:start');
+            if (blocked || controller.signal.aborted || sender.isDestroyed()) return;
+            sender.send('orvex:stt:realtime-event', { id, ...evt });
+          },
+        });
+        const info = await session.ready;
+        if (moved) db.setSetting(STT_POOL_HEALTH_SETTING, sttKeys.withSuccess(health, attempt.id));
+        const entry = { id, session, controller, senderId: sender.id, lastAudioAt: Date.now() };
+        realtimeSessions.set(sender.id, entry);
+        // The service drops a session after ~15 s without audio. An open but quiet
+        // microphone is normal between turns, so a 20 ms silence frame keeps the
+        // socket alive without pretending anybody spoke.
+        entry.keepAlive = setInterval(() => {
+          if (!session.open || Date.now() - entry.lastAudioAt < 3000) return;
+          try {
+            session.send(Buffer.alloc(640));
+            entry.lastAudioAt = Date.now();
+          } catch {
+            /* the close event reports it */
+          }
+        }, 1000);
+        entry.keepAlive.unref?.();
+        const drop = () => {
+          clearInterval(entry.keepAlive);
+          controller.abort();
+          session.close();
+          if (realtimeSessions.get(sender.id) === entry) realtimeSessions.delete(sender.id);
+        };
+        sender.once('destroyed', drop);
+        sender.once('render-process-gone', drop);
+        sender.once('did-start-navigation', drop);
+        entry.drop = drop;
+        return { id, sampleRate: info.sampleRate, model: info.model, commitStrategy: info.commitStrategy, sessionId: info.sessionId };
+      } catch (err) {
+        if (session) session.close();
+        controller.abort();
+        const kind = sttKeys.classifyError(err);
+        if (!sttKeys.shouldRotate(kind)) throw err;
+        refused.push(attempt.id);
+        lastError = err;
+        moved = true;
+        health = sttKeys.withFailure(health, attempt.id, kind, Date.now(), err && err.message ? err.message : String(err));
+      }
+    }
+    db.setSetting(STT_POOL_HEALTH_SETTING, health);
+    const detail = lastError && lastError.message ? ` Last answer: ${lastError.message}` : '';
+    throw new Error(`All ${refused.length} saved ElevenLabs keys were refused for live speech input.${detail}`);
+  });
+  handle('orvex:stt:realtime:audio', ({ id, audio, commit } = {}, event) => {
+    const entry = realtimeSessions.get(event.sender.id);
+    if (!entry || entry.id !== String(id || '')) throw new Error('No live speech session is open.');
+    const blocked = security.channelBlocked('orvex:stt:realtime:audio');
+    if (blocked) {
+      entry.controller.abort();
+      throw new Error(blocked);
+    }
+    entry.lastAudioAt = Date.now();
+    return entry.session.send(Buffer.from(String(audio || ''), 'base64'), commit === true);
+  });
+  handle('orvex:stt:realtime:commit', ({ id } = {}, event) => {
+    const entry = realtimeSessions.get(event.sender.id);
+    if (!entry || entry.id !== String(id || '')) throw new Error('No live speech session is open.');
+    return entry.session.commit();
+  });
+  handle('orvex:stt:realtime:stop', ({ id } = {}, event) => {
+    const entry = realtimeSessions.get(event.sender.id);
+    if (!entry || (id && entry.id !== String(id))) return { stopped: false };
+    entry.drop?.();
+    entry.controller.abort();
+    entry.session.close();
+    realtimeSessions.delete(event.sender.id);
+    return { stopped: true };
+  });
 
   /* Speech input key pool: presence, labels and status only — values stay here. */
   handle('orvex:stt:keys:list', async ({ url } = {}) => {

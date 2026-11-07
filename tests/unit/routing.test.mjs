@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { buildCandidates, orderForTask, pickLocal, routeLabel, TASKS } from '../../src/data/routing'
+import { buildCandidates, orderForTask, routeLabel, TASKS } from '../../src/data/routing'
 
 const provider = (over = {}) => ({
   id: 'openai',
@@ -33,40 +33,35 @@ afterEach(() => {
 describe('buildCandidates', () => {
   const active = provider()
   const ollama = provider({ id: 'ollama', presetId: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', apiKey: '', model: 'llama3.1', kind: 'local' })
-  const keylessHosted = provider({ id: 'groq', presetId: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '', model: 'llama-3.3-70b-versatile' })
+  const groqKeyed = provider({ id: 'groq', presetId: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', apiKey: 'gsk-test', model: 'llama-3.3-70b-versatile' })
+  const keylessHosted = provider({ id: 'mistral', presetId: 'mistral', name: 'Mistral', baseUrl: 'https://api.mistral.ai/v1', apiKey: '', model: 'mistral-small' })
   const disabled = provider({ id: 'anthropic', presetId: 'anthropic', name: 'Anthropic', baseUrl: 'https://api.anthropic.com', apiKey: 'sk-ant', model: 'claude-sonnet-4', enabled: false, api: 'anthropic' })
   const incomplete = provider({ id: 'google', presetId: 'google', name: 'Google', baseUrl: 'https://generativelanguage.googleapis.com', apiKey: 'k', model: '' })
-  const all = [active, ollama, keylessHosted, disabled, incomplete]
+  const all = [active, ollama, groqKeyed, keylessHosted, disabled, incomplete]
 
-  it('puts the active provider first and keeps keyed/local fallbacks', () => {
-    expect(buildCandidates(all, 'openai').map((p) => p.id)).toEqual(['openai', 'ollama'])
+  it('puts the active provider first and keeps keyed hosted fallbacks', () => {
+    expect(buildCandidates(all, 'openai').map((p) => p.id)).toEqual(['openai', 'groq'])
+  })
+
+  it('never falls back to a local server unless it is the active provider', () => {
+    const ids = buildCandidates(all, 'openai').map((p) => p.id)
+    expect(ids).not.toContain('ollama')
+  })
+
+  it('keeps an explicitly chosen local provider on its own', () => {
+    expect(buildCandidates(all, 'ollama').map((p) => p.id)).toEqual(['ollama'])
   })
 
   it('skips disabled, incomplete and keyless hosted providers', () => {
     const ids = buildCandidates(all, null).map((p) => p.id)
-    expect(ids).toEqual(['openai', 'ollama'])
-    expect(ids).not.toContain('groq')
+    expect(ids).toEqual(['openai', 'groq'])
+    expect(ids).not.toContain('mistral')
     expect(ids).not.toContain('anthropic')
     expect(ids).not.toContain('google')
   })
 
   it('returns a single usable provider chain when only one is configured', () => {
     expect(buildCandidates([active], 'openai').map((p) => p.id)).toEqual(['openai'])
-  })
-})
-
-describe('pickLocal', () => {
-  const local = provider({ id: 'ollama', presetId: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', apiKey: '', model: 'llama3.1', kind: 'local' })
-  const other = provider({ id: 'lmstudio', presetId: 'lmstudio', name: 'LM Studio', baseUrl: 'http://localhost:1234/v1', apiKey: '', model: 'qwen', kind: 'local' })
-
-  it('finds a local model that is not the active one', () => {
-    expect(pickLocal([local, other], 'lmstudio')?.id).toBe('ollama')
-    expect(pickLocal([local, other], 'openai')?.id).toBe('ollama')
-  })
-
-  it('returns null when no local model is enabled', () => {
-    expect(pickLocal([provider()], 'openai')).toBeNull()
-    expect(pickLocal([{ ...local, enabled: false }], 'openai')).toBeNull()
   })
 })
 

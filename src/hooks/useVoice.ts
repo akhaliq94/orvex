@@ -1,5 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { isLocalWhisper, hasSpeech, readVoiceConfig, reportSttEndpoint, sttTarget, transcribeClip, type SttTarget } from '../data/stt'
+import {
+  floatToPcm16,
+  hasSpeech,
+  isElevenLabsHost,
+  isLocalWhisper,
+  onRealtimeEvent,
+  pcmChunksToWav,
+  readVoiceConfig,
+  realtimeSupported,
+  reportSttEndpoint,
+  sendRealtimeAudio,
+  startRealtimeStt,
+  stopRealtimeStt,
+  sttTarget,
+  transcribeClip,
+  type RealtimeSession,
+  type SttTarget,
+} from '../data/stt'
 import { stopSpeaking } from '../data/voice'
 import { BargeInDetector } from '../voice/bargein'
 import { listMicrophones, micConstraints, watchDevices, type MicDevice } from '../voice/devices'
@@ -38,6 +55,18 @@ function getSR(): (new () => SpeechRecognitionLike) | null {
   const w = window as unknown as Record<string, unknown>
   const Ctor = (w.SpeechRecognition ?? w.webkitSpeechRecognition) as (new () => SpeechRecognitionLike) | undefined
   return Ctor ?? null
+}
+
+/**
+ * Web Speech wants a full locale. The hosted engines take the bare ISO code
+ * from the same setting, so both paths stay in step with the user's choice.
+ */
+function speechLocale(language: string): string {
+  const code = String(language || '').trim().toLowerCase()
+  if (code === 'ur' || code === 'urd') return 'ur-PK'
+  if (code === 'hi' || code === 'hin') return 'hi-IN'
+  if (code === 'en' || code === 'eng') return 'en-US'
+  return 'en-US'
 }
 
 function pickMime(): string | null {
@@ -123,8 +152,21 @@ export function useVoice(): Voice {
   const silenceTimer = useRef(0)
   const onUtteranceRef = useRef<((text: string, meta?: { wake: boolean }) => void) | null>(null)
   const wakeHandlerRef = useRef<((command: string) => void) | null>(null)
-  /** 'speech' = browser recognition, 'recorder' = record the turn and POST it */
-  const modeRef = useRef<'speech' | 'recorder' | null>(null)
+  /** 'speech' = browser recognition, 'recorder' = record the turn and POST it, 'realtime' = stream the mic */
+  const modeRef = useRef<'speech' | 'recorder' | 'realtime' | null>(null)
+  const realtimeRef = useRef<RealtimeSession | null>(null)
+  const offRealtimeRef = useRef<(() => void) | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const muteRef = useRef<GainNode | null>(null)
+  /** PCM of the turn being spoken, kept so speaker identification still works. */
+  const turnChunksRef = useRef<Uint8Array[]>([])
+  const turnBytesRef = useRef(0)
+  const lastChunkVoiceRef = useRef(0)
+  /** Last few quiet frames, sent when speech starts so the onset is not cut. */
+  const prerollRef = useRef<Uint8Array[]>([])
+  /** Consecutive live-socket drops; a session that produces a transcript resets it. */
+  const reconnectRef = useRef(0)
+  const lastRealtimeErrorRef = useRef('')
   const targetRef = useRef<SttTarget | null>(null)
   const recRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
@@ -145,8 +187,30 @@ export function useVoice(): Voice {
   const bargeRef = useRef(new BargeInDetector({ threshold: 0.18, holdMs: 260 }))
   const restartMicRef = useRef<() => Promise<void>>(async () => {})
 
-  /** How long the speaker must stay quiet before the turn is considered finished. */
-  const SILENCE_MS = 1400
+  /**
+   * How long the speaker must stay quiet before the turn is considered
+   * finished. Urdu and Hindi speakers pause mid-sentence to breathe or find a
+   * word; a short gap treated the pause as the end and ORVEX answered half a
+   * question. ~2 s of quiet is a real end of turn.
+   */
+  const SILENCE_MS = 2000
+  /**
+   * The live socket runs its own voice-activity detector. Six hundred
+   * milliseconds committed while the speaker was still thinking; the service
+   * accepts up to 5 s, so this holds the turn open through a normal pause.
+   */
+  const REALTIME_SILENCE_SECS = 1.6
+  const REALTIME_RATE = 16000
+  /** Keep streaming this long after the voice stops so the service can commit. */
+  const REALTIME_TAIL_MS = 2200
+  /** Below this a chunk is room noise, not speech. */
+  const REALTIME_VOICE_RMS = 0.012
+  /** Chunks of quiet kept so the first syllable of a turn is not clipped. */
+  const REALTIME_PREROLL_CHUNKS = 4
+  /** 45 s of 16 kHz PCM is the most a single turn keeps for fingerprinting. */
+  const REALTIME_MAX_TURN_BYTES = REALTIME_RATE * 2 * 45
+  /** Longest a hands-free turn is allowed to run before it is cut. */
+  const MAX_TURN_MS = 45000
 
   const refreshDevices = useCallback(async () => {
     const res = await listMicrophones()
@@ -209,6 +273,25 @@ export function useVoice(): Voice {
 
   const cleanupAudio = useCallback(() => {
     cancelAnimationFrame(rafRef.current)
+    const processor = processorRef.current
+    processorRef.current = null
+    if (processor) {
+      processor.onaudioprocess = null
+      try {
+        processor.disconnect()
+      } catch {
+        /* already detached */
+      }
+    }
+    const mute = muteRef.current
+    muteRef.current = null
+    if (mute) {
+      try {
+        mute.disconnect()
+      } catch {
+        /* already detached */
+      }
+    }
     streamRef.current?.getTracks().forEach((t) => t.stop())
     streamRef.current = null
     if (ctxRef.current) {
@@ -216,6 +299,190 @@ export function useVoice(): Voice {
       ctxRef.current = null
     }
     levelRef.current = 0
+  }, [])
+
+  /**
+   * Streams the microphone to the live transcription session.
+   *
+   * Only voiced audio is sent, plus a short tail so the service can hear the
+   * pause and commit the turn: streaming an idle room all day would bill for
+   * silence. Partials update the transcript while the speaker is still talking,
+   * and a commit ends the turn immediately — no local silence timer.
+   */
+  const attachRealtime = useCallback(
+    (session: RealtimeSession, ctx: AudioContext, source: MediaStreamAudioSourceNode) => {
+      const previous = offRealtimeRef.current
+      offRealtimeRef.current = null
+      try {
+        previous?.()
+      } catch {
+        /* listener already detached */
+      }
+      turnChunksRef.current = []
+      turnBytesRef.current = 0
+      lastChunkVoiceRef.current = 0
+      prerollRef.current = []
+
+      /**
+       * The service drops a socket after ~15 s without audio and the network can
+       * drop it at any time. Reopening in place keeps the microphone armed, like
+       * the hosted assistants do, instead of ending the conversation.
+       */
+      const reopen = async (attempt: number): Promise<void> => {
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(2500, 250 * 2 ** (attempt - 1))))
+        if (!activeRef.current || realtimeRef.current) return
+        const opened = await startRealtimeStt({ silenceSecs: REALTIME_SILENCE_SECS, language: cfgRef.current.sttLanguage })
+        if (!activeRef.current) {
+          if (opened.ok) void stopRealtimeStt(opened.session.id)
+          return
+        }
+        if (opened.ok) {
+          realtimeRef.current = opened.session
+          turnChunksRef.current = []
+          turnBytesRef.current = 0
+          lastChunkVoiceRef.current = 0
+          prerollRef.current = []
+          setSttUnavailable(null)
+          attachRealtime(opened.session, ctx, source)
+          return
+        }
+        lastRealtimeErrorRef.current = opened.detail
+        if (attempt >= 3) {
+          setError(`Live speech input stopped — ${opened.detail} Tap the mic to try again.`)
+          activeRef.current = false
+          try {
+            offRealtimeRef.current?.()
+          } catch {
+            /* already detached */
+          }
+          offRealtimeRef.current = null
+          cleanupAudio()
+          setStatus('idle')
+          setInterim('')
+          return
+        }
+        await reopen(attempt + 1)
+      }
+
+      let dropped = false
+      const lost = (detail: string) => {
+        if (dropped || !activeRef.current) return
+        dropped = true
+        // A newer session may already have taken over; leave it alone.
+        if (realtimeRef.current !== session) return
+        realtimeRef.current = null
+        turnChunksRef.current = []
+        turnBytesRef.current = 0
+        if (detail) lastRealtimeErrorRef.current = detail
+        reconnectRef.current += 1
+        void reopen(reconnectRef.current)
+      }
+
+      offRealtimeRef.current = onRealtimeEvent((event) => {
+        const live = realtimeRef.current
+        if (!live || event.id !== live.id || !activeRef.current) return
+        if (event.type === 'partial') {
+          if (holdRef.current) return
+          reconnectRef.current = 0
+          const text = (event.text || '').trim()
+          interimRef.current = text
+          setInterim(text)
+          return
+        }
+        if (event.type === 'committed') {
+          const text = (event.text || '').trim()
+          const chunks = turnChunksRef.current
+          turnChunksRef.current = []
+          turnBytesRef.current = 0
+          if (holdRef.current || !hasSpeech(text)) {
+            interimRef.current = ''
+            setInterim('')
+            return
+          }
+          reconnectRef.current = 0
+          failCountRef.current = 0
+          setError(null)
+          interimRef.current = ''
+          setInterim('')
+          transcriptRef.current = text
+          setTranscript(text)
+          feedWake(text)
+          emitTurn(text, chunks.length ? pcmChunksToWav(chunks, session.sampleRate || REALTIME_RATE) : new Blob([], { type: 'audio/wav' }))
+          return
+        }
+        if (event.type === 'error') {
+          // The credential may have died; the main process parks it and the
+          // reopen below walks on to the next saved key.
+          lost(event.message || event.error || '')
+          return
+        }
+        if (event.type === 'closed') lost(event.message || '')
+      })
+
+      // ScriptProcessor is the one capture path that needs no extra module URL
+      // inside the packaged app; its output is muted so the mic is never echoed.
+      const processor = ctx.createScriptProcessor(2048, 1, 1)
+      const mute = ctx.createGain()
+      mute.gain.value = 0
+      processorRef.current = processor
+      muteRef.current = mute
+      source.connect(processor)
+      processor.connect(mute)
+      mute.connect(ctx.destination)
+      processor.onaudioprocess = (e) => {
+        const live = realtimeRef.current
+        if (!live || !activeRef.current || holdRef.current) return
+        const input = e.inputBuffer.getChannelData(0)
+        let sum = 0
+        for (let i = 0; i < input.length; i++) sum += input[i] * input[i]
+        const rms = Math.sqrt(sum / input.length)
+        const now = performance.now()
+        const voiced = rms > REALTIME_VOICE_RMS
+        if (voiced) lastChunkVoiceRef.current = now
+        const pcm = floatToPcm16(input)
+        // Idle room: send nothing, so an open mic does not spend the quota, but
+        // keep the last few frames. Speech usually starts below the gate and
+        // the first word lost its opening consonant when only voiced frames
+        // were streamed.
+        if (!voiced && now - lastChunkVoiceRef.current > REALTIME_TAIL_MS) {
+          prerollRef.current.push(pcm)
+          if (prerollRef.current.length > REALTIME_PREROLL_CHUNKS) prerollRef.current.shift()
+          return
+        }
+        const send = (chunk: Uint8Array) => {
+          if (turnBytesRef.current + chunk.length <= REALTIME_MAX_TURN_BYTES) {
+            turnChunksRef.current.push(chunk)
+            turnBytesRef.current += chunk.length
+          }
+          void sendRealtimeAudio(live.id, chunk)
+        }
+        if (voiced && prerollRef.current.length) {
+          const pre = prerollRef.current
+          prerollRef.current = []
+          for (const chunk of pre) send(chunk)
+        }
+        send(pcm)
+      }
+    },
+    [cleanupAudio, emitTurn, feedWake],
+  )
+
+  const teardownRealtime = useCallback(() => {
+    const off = offRealtimeRef.current
+    offRealtimeRef.current = null
+    try {
+      off?.()
+    } catch {
+      /* listener already detached */
+    }
+    const live = realtimeRef.current
+    realtimeRef.current = null
+    turnChunksRef.current = []
+    turnBytesRef.current = 0
+    prerollRef.current = []
+    reconnectRef.current = 0
+    lastRealtimeErrorRef.current = ''
+    if (live) void stopRealtimeStt(live.id)
   }, [])
 
   const stopSegment = useCallback((discard: boolean) => {
@@ -290,7 +557,7 @@ export function useVoice(): Voice {
       transcribingRef.current = true
       setTranscribing(true)
       setInterim(captured.transcript || 'Transcribing…')
-      void transcribeClip(cfgTarget, blob).then((out) => {
+      void transcribeClip(cfgTarget, blob, { language: cfgRef.current.sttLanguage }).then((out) => {
         if (segmentSeqRef.current !== finalSequence || !activeRef.current) return
         transcribingRef.current = false
         setTranscribing(false)
@@ -360,7 +627,7 @@ export function useVoice(): Voice {
     }
     const seq = segmentSeqRef.current
     setPartial(true)
-    void transcribeClip(target, blob, { timeoutMs: 20000 })
+    void transcribeClip(target, blob, { timeoutMs: 20000, language: cfgRef.current.sttLanguage })
       .then((out) => {
         if (segmentSeqRef.current !== seq) return
         setPartial(false)
@@ -405,6 +672,7 @@ export function useVoice(): Voice {
     holdRef.current = false
     modeRef.current = null
     targetRef.current = null
+    teardownRealtime()
     window.clearTimeout(silenceTimer.current)
     transcriptRef.current = ''
     interimRef.current = ''
@@ -429,7 +697,7 @@ export function useVoice(): Voice {
     cleanupAudio()
     setStatus('idle')
     setInterim('')
-  }, [cleanupAudio])
+  }, [cleanupAudio, teardownRealtime])
 
   const pauseListening = useCallback(() => {
     holdRef.current = true
@@ -449,6 +717,14 @@ export function useVoice(): Voice {
     setTranscript('')
     setInterim('')
     if (!activeRef.current) return
+    if (modeRef.current === 'realtime') {
+      // The session stayed open while ORVEX talked; drop what it heard of its own
+      // voice and start counting the next turn from silence.
+      turnChunksRef.current = []
+      turnBytesRef.current = 0
+      lastChunkVoiceRef.current = 0
+      return
+    }
     if (modeRef.current === 'recorder') {
       // Segments restart on the next detected voice, nothing to kick off here.
       segmentStartRef.current = 0
@@ -512,8 +788,19 @@ export function useVoice(): Voice {
       // Labels are only exposed after permission, so refresh now.
       void refreshDevices()
 
+      const speechTarget = sttTarget(cfg)
+      const desktopReady = typeof window !== 'undefined' && !!(window as unknown as { orvex?: unknown }).orvex
+      const wantRealtime = !!(
+        speechTarget &&
+        desktopReady &&
+        cfg.realtimeStt &&
+        isElevenLabsHost(speechTarget.url) &&
+        realtimeSupported()
+      )
       const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-      const ctx = new Ctx()
+      // Live input is specified as 16 kHz PCM, so capture at that rate instead of
+      // resampling every chunk on its way out.
+      const ctx = wantRealtime ? new Ctx({ sampleRate: REALTIME_RATE }) : new Ctx()
       ctxRef.current = ctx
       const src = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
@@ -545,7 +832,7 @@ export function useVoice(): Voice {
           }
           if (
             recordingRef.current &&
-            (now - lastVoiceRef.current > SILENCE_MS || now - segmentStartRef.current > 20000)
+            (now - lastVoiceRef.current > SILENCE_MS || now - segmentStartRef.current > MAX_TURN_MS)
           ) {
             stopSegRef.current(false)
           }
@@ -562,6 +849,10 @@ export function useVoice(): Voice {
           setTranscript('')
           setInterim('')
           setBargeInAt(Date.now())
+          turnChunksRef.current = []
+          turnBytesRef.current = 0
+          lastChunkVoiceRef.current = 0
+          prerollRef.current = []
           if (modeRef.current === 'speech') restartRecognition()
         }
 
@@ -572,15 +863,35 @@ export function useVoice(): Voice {
       // Speech input. Electron ships without Chromium's cloud speech service, so
       // when a transcription endpoint is configured we record each turn locally
       // and POST it there instead of failing on `network`.
-      const target = sttTarget(cfg)
+      const target = speechTarget
       const mime = pickMime()
       // CPU Whisper serializes inference; partial uploads delay the final turn.
       streamingRef.current = !!(cfg.streaming && target && mime && !isLocalWhisper(target))
-      const desktop = typeof window !== 'undefined' && !!(window as unknown as { orvex?: unknown }).orvex
+      const desktop = desktopReady
       if (!target && desktop) {
         // Chromium's cloud speech service is not part of the desktop runtime;
         // saying "armed" without a real transcription source would be a lie.
         setSttUnavailable('The desktop build has no cloud speech service — add a transcription endpoint in Settings → Voice to use the wake word.')
+      }
+      if (wantRealtime && target) {
+        const opened = await startRealtimeStt({ silenceSecs: REALTIME_SILENCE_SECS, language: cfgRef.current.sttLanguage })
+        if (micSequenceRef.current !== sequence || !activeRef.current) {
+          if (opened.ok) void stopRealtimeStt(opened.session.id)
+          return
+        }
+        if (opened.ok) {
+          realtimeRef.current = opened.session
+          modeRef.current = 'realtime'
+          targetRef.current = target
+          failCountRef.current = 0
+          setSttUnavailable(null)
+          attachRealtime(opened.session, ctx, src)
+          setStatus('listening')
+          return
+        }
+        // Recorded turns still work with the same key, so a refused socket is a
+        // downgrade rather than a dead microphone.
+        setSttUnavailable(`Live speech input could not start — ${opened.detail} Recording each turn instead.`)
       }
       if (target && mime) {
         modeRef.current = 'recorder'
@@ -592,7 +903,7 @@ export function useVoice(): Voice {
         if (Ctor) {
           modeRef.current = 'speech'
           const sr = new Ctor()
-          sr.lang = 'en-US'
+          sr.lang = speechLocale(cfg.sttLanguage)
           sr.continuous = true
           sr.interimResults = true
           sr.onresult = (e) => {
@@ -671,7 +982,7 @@ export function useVoice(): Voice {
         setError('Could not start the microphone.')
       }
     }
-  }, [armSilence, cleanupAudio, feedWake, fingerprint, refreshDevices, restartRecognition])
+  }, [armSilence, attachRealtime, cleanupAudio, feedWake, fingerprint, refreshDevices, restartRecognition])
 
   restartMicRef.current = async () => {
     if (!activeRef.current) return

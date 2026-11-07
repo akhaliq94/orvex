@@ -281,6 +281,8 @@ export type OrvexEngineStartPayload = {
   maxSteps?: number
   task?: string
   mode?: 'agent' | 'orchestrator'
+  /** Send only the essential tools — spoken turns and token-tight providers. */
+  compactTools?: boolean
 }
 
 export type OrvexCodeWorkspace = {
@@ -3171,7 +3173,7 @@ export type OrvexBridge = {
   }
   providers: {
     test: (provider: OrvexAgentProvider) => Promise<IpcResult<{ ok: boolean; label: string; detail: string }>>
-    models: (provider: OrvexAgentProvider) => Promise<IpcResult<{ models: { id: string; free: boolean }[]; priced: boolean } | null>>
+    models: (provider: OrvexAgentProvider) => Promise<IpcResult<{ models: { id: string; free: boolean }[]; priced: boolean; skipped?: string[] } | null>>
   }
   stt: {
     transcribe: (payload: {
@@ -3180,6 +3182,8 @@ export type OrvexBridge = {
       audio: ArrayBuffer
       type?: string
       timeoutMs?: number
+      /** ISO language hint ('ur', 'hi', 'en'); ignored when empty. */
+      language?: string
     }) => Promise<IpcResult<{ text: string }>>
     /** Record the endpoint speech input will use, so local Whisper only runs when it is needed. */
     setEndpoint: (url: string) => Promise<IpcResult<{ local: boolean }>>
@@ -3214,6 +3218,31 @@ export type OrvexBridge = {
       add: (key: string, label: string, url: string) => Promise<IpcResult<{ added: boolean; count: number; reason?: string }>>
       remove: (id: string, url: string) => Promise<IpcResult<{ count: number }>>
       reset: () => Promise<IpcResult<{ cleared: boolean }>>
+    }
+    /** Live microphone streaming; the socket and the key stay in the main process. */
+    realtime: {
+      start: (payload?: {
+        model?: string
+        language?: string
+        silenceSecs?: number
+      }) => Promise<IpcResult<{ id: string; sampleRate: number; model: string; commitStrategy: string; sessionId: string }>>
+      audio: (id: string, audio: string, commit?: boolean) => Promise<IpcResult<{ sent: boolean; bytes: number }>>
+      commit: (id: string) => Promise<IpcResult<{ sent: boolean; bytes: number }>>
+      stop: (id?: string) => Promise<IpcResult<{ stopped: boolean }>>
+      onEvent: (
+        cb: (event: {
+          id: string
+          type: 'ready' | 'partial' | 'committed' | 'warning' | 'error' | 'closed'
+          text?: string
+          message?: string
+          error?: string
+          code?: number
+          sampleRate?: number
+          model?: string
+          commitStrategy?: string
+          sessionId?: string
+        }) => void,
+      ) => () => void
     }
   }
   routing: {
@@ -3480,6 +3509,21 @@ export type OrvexBridge = {
     }) => Promise<IpcResult<{ asset: OrvexMediaAsset; model: string; voiceId: string; duration: number | null }>>
     stopHeygenTts: (id: string) => Promise<IpcResult<{ stopped: boolean }>>
     onHeygenAudio: (cb: (event: { id: string; index: number; audio: string }) => void) => () => void
+    /** ElevenLabs speech output. Frames are base64 PCM, played as they arrive. */
+    elevenVoices: () => Promise<
+      IpcResult<{ voices: { voiceId: string; name: string; category: string; labels: Record<string, string> }[]; endpoint: string }>
+    >
+    elevenModels: () => Promise<IpcResult<{ models: string[]; endpoint: string; source: string }>>
+    elevenTtsStream: (payload: {
+      id: string
+      text: string
+      voiceId: string
+      model?: string
+      speed?: number
+      stability?: number
+    }) => Promise<IpcResult<{ model: string; voiceId: string; bytes: number; frames: number; sampleRate: number; duration: number }>>
+    stopElevenTts: (id: string) => Promise<IpcResult<{ stopped: boolean }>>
+    onElevenAudio: (cb: (event: { id: string; index: number; audio: string; sampleRate: number }) => void) => () => void
     heygenTts: (payload: {
       text: string
       voiceId: string
